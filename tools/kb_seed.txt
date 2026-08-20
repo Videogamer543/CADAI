@@ -1,0 +1,79 @@
+# Starter corpus for the assistant's knowledge base.
+#
+#   python tools/kb_ingest.py seed
+#
+# Format: one URL per line, optionally followed by "| kind".
+# Kinds: reference (default), docs, data, vendor, forum, blog, exercise, rules.
+# Blank lines and anything after a # are ignored.
+#
+# The kind matters. app/chat.py demotes narrow-scope documents when the
+# question is a general one: a design challenge states requirements that are
+# true only inside that challenge, and the assistant answering "how do I design
+# a shooter" with one challenge's acceptance criteria is the exact bug this
+# whole pipeline was built to stop.
+#
+# Which is why the learning course is NOT in the list below, and is not tagged
+# "exercise" either. It is both things at once -- sections 1b, 2a and 2c teach
+# motors, gears, ball trajectory and intake geometry, which are the best
+# general answers in the corpus, while the numbered exercises set challenges
+# whose limits are local to them. One --kind over the whole course is wrong
+# whichever one you pick. Use the recipe, which splits them per page:
+#
+#   python tools/kb_ingest.py frcdesign
+#
+# That crawls the design handbook, the whole learning course, the mechanism
+# examples and the CAD best practices, tagging the exercises as exercises and
+# the teaching pages as reference. It replaces rather than duplicates, so
+# re-running it to pick up new material is safe. One section at a time:
+#
+#   python tools/kb_ingest.py frcdesign --only course
+#
+# Doing it by hand, if you want different settings, is the same thing spelled
+# out -- note the --kind-for rules, which are the part that matters:
+#
+#   python tools/kb_ingest.py crawl https://www.frcdesign.org/learning-course/ \
+#       --prefix --depth 4 --max 200 \
+#       --kind-for "/exercise=exercise" --kind-for "project-overview=exercise"
+#
+# This list is intentionally short. Thirty good pages beat three hundred
+# mediocre ones -- every page you add is a page that can win a ranking slot
+# from a better one. Add your own team's handbook, your shop's tooling notes,
+# and the vendor pages for parts you actually use:
+#
+#   python tools/kb_ingest.py file team-handbook.pdf --kind reference
+#
+# A page that is a *list* of resources does not belong in this file. `seed`
+# reads one page per line, and such a page's own text is link labels and
+# blurbs. Hand it to `hub`, which ingests the documents it points at rather
+# than the list:
+#
+#   python tools/kb_ingest.py hub \
+#       https://www.firstinspires.org/resources/library/frc/technical-resources \
+#       --dry-run
+
+# Everything below is also covered, and covered more thoroughly, by
+# `kb_ingest.py frcdesign`. It stays here so `seed` still gives a useful corpus
+# on its own, and because re-ingesting replaces rather than duplicates, running
+# both costs nothing.
+
+# --- FRCDesign design handbook: broad-scope engineering practice -------------
+https://www.frcdesign.org/design-handbook/
+https://www.frcdesign.org/design-handbook/structure/structure/
+https://www.frcdesign.org/design-handbook/structure/materials/
+https://www.frcdesign.org/design-handbook/structure/fasteners/
+https://www.frcdesign.org/design-handbook/structure/intro-to-3d-printing/
+https://www.frcdesign.org/design-handbook/structure/design-for-3d-printing/
+https://www.frcdesign.org/design-handbook/power-transmission/motion-components/
+https://www.frcdesign.org/design-handbook/design-writeups/designing-for-controllability/
+
+# --- CAD practice ------------------------------------------------------------
+https://www.frcdesign.org/best-practices/
+https://www.frcdesign.org/best-practices/document-setup/
+https://www.frcdesign.org/best-practices/sub-document-setup/
+https://www.frcdesign.org/best-practices/master-sketch-setup/
+https://www.frcdesign.org/best-practices/feature-tree-setup/
+https://www.frcdesign.org/best-practices/assembly-setup/
+
+# --- Worked mechanisms -------------------------------------------------------
+https://www.frcdesign.org/mechanism-examples/
+https://www.frcdesign.org/resources/

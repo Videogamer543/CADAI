@@ -1,0 +1,43 @@
+# What NOT to send to Cloud Build.
+#
+# This file has to exist, and the reason is a trap rather than an optimisation.
+# When there is no .gcloudignore, `gcloud run deploy --source .` falls back to
+# reading .gitignore -- and .gitignore excludes data/kb.json, deliberately,
+# because a 900 KB knowledge base does not belong in a git repo. It very much
+# does belong in the image. Without this file the build silently succeeds and
+# the deployed assistant comes up with an empty library, citing nothing, which
+# reads as a broken bot rather than an unpopulated one. (/api/kb reporting
+# "docs: 0" is that failure.)
+#
+# So: list the exclusions explicitly here, and data/ is conspicuously not among
+# them.
+
+# Several hundred megabytes of Windows virtualenv that the image rebuilds from
+# requirements.txt anyway. This is the one that actually matters -- uploading it
+# is slow and it is useless once uploaded, because Linux cannot run it.
+.venv/
+venv/
+
+# Secrets. Cloud Run reads environment variables set with `gcloud run services
+# update`, never a file. A .env inside a container image is a .env you have
+# published.
+.env
+
+# Compiled bytecode from a different Python on a different OS.
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Training inputs for the pocket calibration, ~7 MB of STEP. The calibration
+# result (data/pocket_cal.json) is what the app reads; the parts it was derived
+# from are not needed at runtime.
+reference_parts/
+
+# Written at run time.
+outputs/
+
+# Windows launchers and local history -- nothing the container can use.
+*.bat
+.git/
+.gitignore
+stressviz-cloud.zip

@@ -1,0 +1,30 @@
+{
+  "_comment": "Written by tools/pocket_ref.py fit. Delete this file to restore the defaults in app/pocketing.py CAL_DEFAULTS. Hand-editing is fine; unknown keys are ignored.",
+  "fitted_on": [
+    "2813-2026-P2001 (1)",
+    "2813-2026-P4019 (1)",
+    "2813-2026-P4041 (1)",
+    "2813-2026R-P3003 (1)",
+    "2813-2026R-P4008 (1)",
+    "2813-2026R-P4010 (1)",
+    "2813-O2025-P4005 (1)",
+    "2813-O2025-P5006 (1)",
+    "2813-O2025-P5009 (1)"
+  ],
+  "n_parts": 9,
+  "span_mm": [
+    133.5,
+    609.7
+  ],
+  "gap_before": 0.1337,
+  "gap_after": 0.1298,
+  "density": "normal",
+  "constants": {
+    "cell_span_f": 0.26,
+    "cell_short_f": 0.365,
+    "cell_rib_f": 5.0,
+    "target_lo": 0.3519,
+    "target_hi": 0.5519,
+    "thick_exp": 0.5
+  }
+}

@@ -1,0 +1,36 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+numpy>=1.26
+scipy>=1.11
+scikit-fem>=10.0
+triangle>=20230923
+shapely>=2.0
+opencv-python-headless>=4.9
+Pillow>=10.0
+requests>=2.31
+python-dotenv>=1.0
+gmsh>=4.11
+
+# Knowledge-base ingestion (tools/kb_ingest.py). beautifulsoup4 gives clean
+# article text out of a web page; without it the tool falls back to a regex
+# stripper that works but keeps more navigation junk. pypdf is only needed if
+# you ingest PDFs. Both are small and neither is imported by the server, so a
+# failed install here cannot stop the app from starting.
+beautifulsoup4>=4.12
+# 4.0 is the floor because that is where extract_text(extraction_mode="layout")
+# arrives, and app/pdftext.py needs the layout to see column gutters, running
+# headers and table rows. An older pypdf still works -- it says so in the
+# warnings and falls back to flat extraction -- but two-column PDFs then come
+# out interleaved.
+pypdf>=4.0
+# NOT listed: pytesseract and pypdfium2, for reading scanned PDFs. OCR also
+# needs the Tesseract program itself, which pip cannot install, so listing the
+# Python halves would promise a feature that then fails at run time on a
+# machine that looks correctly set up. tools/kb_ingest.py pdfcheck reports
+# whether OCR is available and names exactly what is missing.
+# NOTE: pypardiso is deliberately NOT listed here. The 3D solid stress map is
+# several times faster with it (Intel PARDISO instead of SciPy's SuperLU), but
+# it drags in the whole MKL runtime and app/fem3d.py works without it. Listing
+# it would mean one bad wheel aborts the entire install, so START_APP.bat
+# installs it separately as a best-effort step that is allowed to fail.

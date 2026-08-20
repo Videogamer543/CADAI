@@ -1,0 +1,2279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CADAI — Python FEM</title>
+<style>
+  /* ---------------------------------------------------------------------
+     Monochrome dark. One hue for the whole interface -- neutral grey from
+     #0a0a0a to #fafafa -- so that the only colour anywhere on screen is
+     data: the stress field, its legend, and the status marks inside a cited
+     answer. That is the point of the scheme rather than a style preference.
+     A UI that spends colour on its own buttons is competing with the one
+     picture the user is here to read.
+     --------------------------------------------------------------------- */
+  :root{
+    --bg:#0a0a0a; --panel:#101010; --sunk:#161616; --raise:#1c1c1c;
+    --line:#262626; --line2:#333; --edge:#4d4d4d;
+    --txt:#e6e6e6; --dim:#a3a3a3; --dim2:#737373; --hi:#fafafa;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;font-family:'Segoe UI',system-ui,sans-serif}
+  body{background:var(--bg);color:var(--txt);display:flex;height:100vh;overflow:hidden}
+  .side{width:290px;background:var(--panel);border-right:1px solid var(--line);padding:16px;overflow-y:auto}
+  .side h1{font-size:1.15rem;color:var(--hi);letter-spacing:.06em;font-weight:700}
+  .side .sub{font-size:.66rem;color:var(--dim2);margin-bottom:14px;letter-spacing:.02em}
+  label{display:block;font-size:.7rem;color:var(--dim);margin:11px 0 4px;font-weight:600;letter-spacing:.03em}
+  select,input[type=number]{width:100%;background:var(--sunk);border:1px solid var(--line);color:var(--txt);padding:7px;border-radius:6px;font-size:.78rem}
+  select:focus,input[type=number]:focus{outline:0;border-color:var(--edge)}
+  .drop{border:1px dashed var(--line2);border-radius:8px;padding:16px;text-align:center;font-size:.75rem;color:var(--dim2);cursor:pointer}
+  .drop:hover{border-color:var(--edge);background:var(--sunk);color:var(--dim)}
+  .row{display:flex;gap:6px}.row>*{flex:1}
+  .ck{display:flex;align-items:center;gap:8px;margin-top:11px;font-size:.76rem;cursor:pointer}
+  .ck input{width:15px;height:15px;accent-color:#d4d4d4}
+  button.run{width:100%;margin-top:14px;padding:11px;border:0;border-radius:8px;cursor:pointer;
+    background:var(--hi);color:#0a0a0a;font-weight:700;font-size:.85rem;letter-spacing:.02em}
+  button.run:hover:not(:disabled){background:#fff}
+  button.run:disabled{background:var(--raise);color:var(--dim2);cursor:default}
+  .main{flex:1;display:flex;flex-direction:column;min-width:0}
+  .bar2{height:42px;display:flex;align-items:center;gap:8px;padding:0 14px;background:var(--panel);border-bottom:1px solid var(--line)}
+  .tab{font-size:.74rem;padding:5px 12px;border-radius:6px;border:1px solid var(--line);background:transparent;color:var(--dim);cursor:pointer}
+  .tab:hover{color:var(--txt);border-color:var(--line2)}
+  .tab.on{background:var(--raise);border-color:var(--edge);color:var(--hi)}
+  /* The map is deliberately not allowed to fill the pane. A stress field read
+     at arm's length is read by its shape and its hot spot, not its pixels, and
+     the zoomer is there for anyone who wants the pixels. */
+  .canvas-wrap{flex:1;display:grid;place-items:center;position:relative;overflow:hidden;padding:14px}
+  canvas{max-width:76%;max-height:78%;border-radius:8px;background:#0d0d0d;display:none}
+  /* Zoom is a CSS transform on the canvas rather than a re-render at a larger
+     bitmap: the field only ever has one pixel per image pixel, so redrawing it
+     bigger would invent detail that the solve does not have. It also keeps
+     every hit test honest -- getBoundingClientRect() reports the TRANSFORMED
+     box, so the hover readout maps the cursor back to the same field pixel at
+     any zoom without a single extra line of arithmetic. */
+  #cv,#cvp{transform-origin:center center;will-change:transform}
+  #cv.grab,#cvp.grab{cursor:grab}
+  #cv.grabbing,#cvp.grabbing{cursor:grabbing}
+  .zoomer{position:absolute;right:12px;top:12px;display:none;gap:4px;z-index:7;
+          background:rgba(10,10,10,.85);border:1px solid var(--line2);border-radius:8px;padding:4px}
+  .zoomer button{width:26px;height:24px;border:0;border-radius:5px;background:var(--raise);color:var(--dim);
+                 cursor:pointer;font-size:.8rem;line-height:1}
+  .zoomer button:hover{background:#2e2e2e;color:var(--hi)}
+  .zoomer button.wide{width:auto;padding:0 8px;font-size:.66rem}
+  .zoomer .lvl{align-self:center;font-size:.64rem;color:var(--dim2);padding:0 4px;min-width:34px;text-align:center}
+  .bar{height:40px;display:flex;align-items:center;gap:12px;padding:0 14px;background:var(--panel);border-top:1px solid var(--line);font-size:.72rem;color:var(--dim)}
+  .legend{height:11px;width:170px;border-radius:3px;background:linear-gradient(to right,#00c846,#78d200,#eab308,#f97316,#ff0000)}
+  /* ---- example parts -------------------------------------------------- */
+  .thumbs{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:8px}
+  .thumb{background:var(--sunk);border:1px solid var(--line);border-radius:6px;
+         padding:4px 3px 3px;cursor:pointer;text-align:center}
+  .thumb:hover{border-color:var(--edge);background:var(--raise)}
+  .thumb.on{border-color:var(--hi)}
+  /* Overrides the global canvas rule, which hides canvases by default and caps
+     them at the size of the main viewport. */
+  .thumb canvas{display:block;width:100%;height:auto;max-width:none;max-height:none;background:transparent;border-radius:3px}
+  .thumb span{display:block;font-size:.53rem;color:var(--dim2);margin-top:3px;letter-spacing:.02em;
+              white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .thumb:hover span,.thumb.on span{color:var(--txt)}
+  .thumbhint{font-size:.6rem;color:var(--dim2);line-height:1.45;margin-top:6px}
+  #demoBadge{position:absolute;left:12px;top:12px;z-index:3;display:none;pointer-events:none;
+    background:rgba(10,10,10,.85);border:1px solid var(--line2);border-radius:8px;padding:9px 11px;
+    font-size:.62rem;line-height:1.7;color:var(--dim);max-width:270px}
+  #demoBadge b{display:block;color:var(--hi);letter-spacing:.13em;font-size:.6rem;margin-bottom:3px}
+  /* chat */
+  .chat{width:560px;min-width:340px;max-width:70vw;background:var(--panel);border-left:1px solid var(--line);display:flex;flex-direction:column;position:relative}
+  .chat h2{font-size:.82rem;color:var(--hi);padding:12px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px;letter-spacing:.04em}
+  .chat h2 button{margin-left:auto;background:var(--raise);border:1px solid var(--line2);color:var(--dim);border-radius:6px;font-size:.68rem;padding:3px 9px;cursor:pointer;line-height:1.4;letter-spacing:0}
+  .chat h2 button:hover{color:var(--hi);border-color:var(--edge)}
+  /* Drag handle on the left edge: a long cited answer can be given as much
+     width as it needs instead of running off the bottom of a fixed column. */
+  .grip{position:absolute;left:-3px;top:0;bottom:0;width:7px;cursor:col-resize;z-index:5}
+  .grip:hover{background:rgba(255,255,255,.18)}
+  .msgs{flex:1;overflow-y:auto;overflow-anchor:none;padding:10px 12px;display:flex;flex-direction:column;gap:8px}
+  .m{padding:8px 11px;border-radius:10px;font-size:.78rem;line-height:1.55;max-width:92%}
+  /* Clamp very long answers so the top of the reply stays on screen; the
+     toggle expands them in place. */
+  .m.a .body.clip{max-height:360px;overflow:hidden;-webkit-mask-image:linear-gradient(#000 78%,transparent);mask-image:linear-gradient(#000 78%,transparent)}
+  .m.a .more{margin-top:6px;font-size:.7rem;color:var(--hi);background:none;border:0;padding:0;cursor:pointer;text-align:left;text-decoration:underline}
+  .jump{position:absolute;right:16px;bottom:70px;background:#e5e5e5;color:#0a0a0a;border:0;border-radius:14px;font-size:.68rem;padding:4px 11px;cursor:pointer;display:none;z-index:6;box-shadow:0 2px 8px rgba(0,0,0,.6)}
+  .m.u{align-self:flex-end;background:#232323;color:#f5f5f5;border:1px solid #2e2e2e}
+  .m.a{align-self:flex-start;background:#141414;border:1px solid var(--line)}
+  .m.a sup a{color:var(--hi);text-decoration:none;font-weight:700}
+  .cin{display:flex;gap:6px;padding:10px;border-top:1px solid var(--line)}
+  .cin textarea{flex:1;background:var(--sunk);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:8px;font-size:.78rem;resize:none;height:40px}
+  .cin textarea:focus{outline:0;border-color:var(--edge)}
+  .cin button{background:var(--hi);border:0;border-radius:8px;color:#0a0a0a;width:42px;cursor:pointer;font-size:.9rem}
+  .cin button:hover{background:#fff}
+  /* load context: write the loading in words instead of translating it into
+     a load case and a newton figure by hand */
+  #loadCtx{width:100%;background:var(--sunk);border:1px solid var(--line);color:var(--txt);
+    border-radius:6px;padding:7px;font-size:.72rem;line-height:1.45;resize:vertical;height:66px}
+  #loadCtx:focus{outline:0;border-color:var(--edge)}
+  .ctxbtn{width:100%;margin-top:5px;padding:6px;border:1px solid var(--line2);border-radius:6px;
+    background:var(--raise);color:var(--txt);font-size:.7rem;font-weight:600;cursor:pointer}
+  .ctxbtn:hover{border-color:var(--edge);background:#242424}
+  .ctxbtn:disabled{opacity:.55;cursor:default}
+  #ctxOut{font-size:.63rem;line-height:1.5;color:var(--dim);margin-top:6px}
+  #ctxOut .hit{color:var(--hi);font-weight:600}#ctxOut .guess{color:var(--dim2)}
+  /* stress-map overlays: the key in the corner and the hover readout */
+  #mapKey,#pocketKey,#key3d{position:absolute;left:12px;top:12px;display:none;z-index:3;pointer-events:none;
+    background:rgba(10,10,10,.85);border:1px solid var(--line2);border-radius:8px;padding:9px 11px;
+    backdrop-filter:blur(3px);font-size:.62rem;line-height:1.75;color:var(--txt);min-width:220px}
+  #mapKey .ttl,#pocketKey .ttl,#key3d .ttl{font-size:.6rem;letter-spacing:.13em;color:var(--dim);font-weight:700;margin-bottom:3px}
+  #mapKey .k i,#pocketKey .k i,#key3d .k i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:7px}
+  #pocketKey .k i.ring{background:none;border:2px solid;border-radius:50%;width:9px;height:9px}
+  #mapKey .k b,#pocketKey .k b,#key3d .k b{color:var(--hi);font-weight:700}
+  #mapKey .foot,#pocketKey .foot,#key3d .foot{margin-top:5px;padding-top:4px;border-top:1px solid var(--line);color:var(--dim2);font-size:.58rem}
+  #tip{position:absolute;display:none;z-index:4;pointer-events:none;max-width:290px;
+    background:rgba(16,16,16,.97);border:1px solid var(--line2);border-radius:10px;padding:10px 13px;
+    box-shadow:0 8px 26px rgba(0,0,0,.7);font-size:.72rem;line-height:1.6;color:var(--txt)}
+  #tip .h{font-size:.8rem;font-weight:700;margin-bottom:3px;color:var(--hi)}
+  #tip .sub{color:var(--dim);font-size:.66rem}
+  .disclaimer{margin:8px 0 2px;padding:7px 9px;border-left:2px solid var(--edge);
+    background:rgba(255,255,255,.04);border-radius:3px;
+    font-size:.63rem;line-height:1.5;color:var(--dim)}
+  .disclaimer b{color:var(--hi);font-weight:700}
+
+  /* ================= responsive =======================================
+     The page was built as three fixed columns -- 290 px of controls, a
+     flexible canvas, 560 px of assistant -- inside `body{display:flex;
+     height:100vh;overflow:hidden}`. That is a good desktop layout and an
+     unusable phone one: the two side columns alone claim 630 px before the
+     canvas gets a single pixel, so on anything under about 800 px the middle
+     collapses to nothing and the page cannot be scrolled to reach it,
+     because the body is height-locked with overflow hidden.
+
+     Three breakpoints, each undoing one assumption rather than restyling
+     from scratch:
+
+     1200px  the columns still work, they are just greedy. Narrow them.
+      900px  columns stop working. Unlock the body height, stack the three
+             panels vertically, and let the page scroll like a document.
+             Every fixed width becomes auto; the vertical borders that
+             separated columns become horizontal ones between sections.
+      560px  phone. Paired fields stop sharing a row, the overlay keys stop
+             being fixed-width boxes that hang off the canvas edge, and the
+             guide loses its wide gutters.
+
+     The canvases need no JS change: they are sized by CSS percentage and
+     drawn from fixed backing-store dimensions, so they scale on their own. */
+  @media (max-width: 1200px){
+    .side{width:250px}
+    .chat{width:400px;min-width:290px}
+    canvas{max-width:88%;max-height:82%}
+  }
+  @media (max-width: 900px){
+    /* The height lock is the thing that makes narrow screens unusable, so it
+       is the first thing to go. min-height keeps a short page filling the
+       screen; overflow-y:auto lets a tall one scroll. */
+    body{flex-direction:column;height:auto;min-height:100vh;overflow-y:auto}
+    .side{width:auto;border-right:0;border-bottom:1px solid var(--line);overflow:visible}
+    .main{min-height:68vh}
+    .chat{width:auto;min-width:0;max-width:none;height:62vh;
+          border-left:0;border-top:1px solid var(--line)}
+    .grip{display:none}            /* drag-to-resize is meaningless stacked */
+    .canvas-wrap{padding:10px;min-height:54vh}
+    canvas{max-width:100%;max-height:100%}
+    /* Four tabs plus the material readout do not fit; scroll them sideways
+       rather than wrapping, which would change the bar's height and push the
+       canvas down on every render. */
+    .bar2{overflow-x:auto;flex-wrap:nowrap;scrollbar-width:none}
+    .bar2::-webkit-scrollbar{display:none}
+    .tab,#metaTop{white-space:nowrap;flex:0 0 auto}
+    .bar{height:auto;min-height:40px;flex-wrap:wrap;padding:6px 12px;gap:8px}
+    .thumbs{grid-template-columns:repeat(6,1fr)}
+  }
+  @media (max-width: 560px){
+    .side{padding:12px}
+    .thumbs{grid-template-columns:repeat(3,1fr)}
+    .row{flex-direction:column;gap:0}
+    .row>*{margin-top:4px}
+    /* These are absolutely positioned overlays with a 220 px floor. On a
+       360 px screen that floor plus the canvas padding runs them off the
+       edge, so drop it and let them fit the viewport. */
+    #mapKey,#pocketKey,#key3d,#demoBadge{min-width:0;max-width:calc(100vw - 44px);font-size:.58rem}
+    #tip{max-width:calc(100vw - 44px)}
+    .hint{max-width:none}
+    #guidePane{padding:16px 14px 32px}
+    /* Reading is the main activity on a phone, so the guide gets the screen
+       rather than sharing it with a canvas that is not being used. */
+    .main{min-height:82vh}
+    .canvas-wrap{min-height:74vh}
+    .m{max-width:100%}
+    .chat{height:70vh}
+  }
+</style>
+</head>
+<body>
+  <div class="side">
+    <h1>CADAI</h1>
+    <div class="sub">Python FEM engine · scikit-fem + Triangle</div>
+    <!-- Says the quiet part out loud, permanently, and where the part is
+         uploaded rather than buried in a README nobody opens. This is a linear
+         elastic approximation of a simplified shape under a guessed load, and
+         the moment strangers can reach it somebody will read a green picture as
+         permission to machine a bracket. Amber rather than red: it is a caveat,
+         not an error, and a red banner on every screen stops being read by
+         Tuesday. -->
+    <div class="disclaimer">
+      <b>Design intuition, not certification.</b>
+      Linear elastic FEM on a simplified shape — no welds, fasteners, impacts,
+      fatigue life or safety factors. Check anything load-bearing yourself
+      before you cut it.
+    </div>
+    <div class="drop" id="drop" onclick="fileInput.click()">Drop / click to upload a part image or STEP file</div>
+    <input type="file" id="fileInput" accept="image/*,.step,.stp,.STEP,.STP" style="display:none">
+    <div id="fname" style="font-size:.68rem;color:#d4d4d4;min-height:15px;margin-top:4px"></div>
+
+    <!-- Example parts. These are not decoration and not screenshots: each one
+         is a real outline drawn to a canvas, and clicking it hands that canvas
+         to the same upload path a photographed part goes through. So the
+         Analyze button runs a genuine solve on it. The gallery exists because
+         an empty tool is hard to judge -- most people want to see what the
+         output looks like before they go and find a STEP file. -->
+    <label>Example parts <span style="color:#737373;font-weight:400">— click to load</span></label>
+    <div class="thumbs" id="thumbs"></div>
+    <div class="thumbhint">Loads the outline as if you had uploaded it, then press Run.</div>
+
+    <label>Material</label>
+    <select id="material"></select>
+    <div id="matNote" style="display:none;font-size:.63rem;line-height:1.45;color:#a3a3a3;margin-top:5px;padding:6px 8px;background:#141414;border-left:2px solid #404040;border-radius:3px"></div>
+
+    <label>Mode</label>
+    <select id="mode">
+      <option value="structural">Structural</option>
+      <option value="fatigue">Fatigue (Kt 1.35)</option>
+      <option value="manufacturing">Manufacturing (Kt 1.15)</option>
+    </select>
+
+    <label>Load context <span style="color:#737373;font-weight:400">— in your own words</span></label>
+    <textarea id="loadCtx" placeholder="bolted to the gearbox on the left, the roller pushes down about 40 lb on the far end, 1/4 in 7075 plate"></textarea>
+    <button class="ctxbtn" id="ctxBtn" onclick="parseCtx()">Read this &amp; set the fields below</button>
+    <div id="ctxOut"></div>
+
+    <label>Load case</label>
+    <select id="loadCase">
+      <option value="cantilever">Cantilever</option>
+      <option value="ss_center">Simply supported — center</option>
+      <option value="ss_dist">Simply supported — distributed</option>
+      <option value="fixed_fixed">Fixed–fixed</option>
+    </select>
+
+    <div class="row">
+      <div><label>Span axis</label>
+        <select id="orientation" title="The part's LONG direction in the image — not the direction the force points. The load is applied across this axis automatically."><option value="horizontal">Horizontal ↔</option><option value="vertical">Vertical ↕</option></select></div>
+      <div><label>Load (N)</label><input type="number" id="load" value="500" step="10"></div>
+    </div>
+    <!-- This said "Load axis" until it caused a real misdiagnosis. Everyone,
+         including the person who wrote the label, reads that as "which way does
+         the force point" -- and it is not that. solve_plane_stress() uses this
+         value as the SPAN axis (fem.py: `ax = 0 if orientation == "horizontal"`,
+         `trans_dof = 1`), and the load then goes on the perpendicular DOF by
+         itself. A 368 x 49 mm arm lying left-to-right is Horizontal whether the
+         roller pushes down on it or sideways.
+         Getting it backwards is not a small error: it swaps a 368 mm span for a
+         49 mm one, and since bending stress goes with span while section
+         modulus goes with depth squared, the answer moves by roughly two orders
+         of magnitude -- quietly, with no warning, in the direction that looks
+         reassuring. Hence the rename and the note below. -->
+    <div style="font-size:.62rem;color:#737373;margin:-4px 0 8px;line-height:1.45">
+      The part's <b>long</b> direction — not the way the force points. The load
+      is always applied across it.</div>
+    <label>Thickness (mm)<span style="color:#737373;font-weight:400"> — measured from STEP files</span></label>
+    <input type="number" id="thick" value="6.35" step="0.25" min="0.3">
+    <div id="thickNote" style="font-size:.62rem;color:#737373;margin-top:3px;line-height:1.4"></div>
+
+    <label class="ck"><input type="checkbox" id="pocket"><span>Pocketing (2D plates)</span></label>
+    <div class="row" id="pocketOpts" style="display:none">
+      <div><label>Rib (mm)</label><input type="number" id="rib" value="3" step="0.5"></div>
+      <div><label>Density</label><select id="density"><option value="normal">Normal</option><option value="aggressive">Aggressive</option><option value="conservative">Conservative</option></select></div>
+    </div>
+    <label class="ck" id="outlineRow" style="display:none"><input type="checkbox" id="showCuts" checked onchange="if(lastData)render(lastData)"><span>Outline the pockets on the stress map</span></label>
+    <label class="ck"><input type="checkbox" id="showMarks" checked onchange="if(lastData)render(lastData)"><span>Label the stress points</span></label>
+
+    <button class="run" id="run" disabled onclick="analyze()">▶ Run FEM Analysis</button>
+    <div id="status" style="font-size:.66rem;color:#737373;margin-top:9px;line-height:1.5"></div>
+  </div>
+
+  <div class="main">
+    <div class="bar2">
+      <button class="tab on" id="tabStress" onclick="showView('stress')">Stress map</button>
+      <button class="tab" id="tabPocket" onclick="showView('pocket')">Pocketing</button>
+      <button class="tab" id="tab3d" onclick="showView('3d')" style="display:none">🧊 3D Solid</button>
+      <!-- Always enabled, unlike the other three. The guide is the one tab
+           that has to work before a part is loaded, because the person who
+           most needs it has not managed to load one yet. -->
+      <button class="tab" id="tabGuide" onclick="showView('guide')">Guide</button>
+      <span id="metaTop" style="margin-left:auto;font-size:.72rem;color:#a3a3a3"></span>
+    </div>
+    <!-- A part that solves at SF 1.0x is almost never a part that is genuinely
+         one percent away from yielding. It is a load, a thickness or a material
+         that never made it into the fields. Before this banner existed that
+         result was reported as " · SF 1.0×" in grey, in the far corner of the
+         status bar, indistinguishable from a healthy answer -- and the pocketer
+         downstream then correctly refused to remove any material, which reads
+         as the pocketer being broken rather than the inputs being wrong. That
+         exact chain cost an afternoon once. -->
+    <div id="sfWarn" style="display:none;margin:0 0 6px;padding:7px 10px;border-radius:6px;font-size:.68rem;line-height:1.5"></div>
+    <!-- Shown when /api/analyze had to fall down the tessellation ladder. Kept
+         separate from sfWarn because the two say different things: sfWarn is
+         "your inputs look wrong", this is "the answer is real but it was drawn
+         from a coarser mesh than we wanted". -->
+    <div id="meshWarn" style="display:none;margin:0 0 6px;padding:7px 10px;border-radius:6px;font-size:.68rem;line-height:1.5;background:rgba(120,80,10,.28);border:1px solid #a16207;color:#fde68a"></div>
+    <!-- Errors used to go to #status, a ~180 px column in the sidebar, where a
+         sentence naming three failed tessellation attempts renders as the word
+         "Error:" and nothing else -- the message was written, displayed, and
+         still unreadable. It belongs out here at full width, selectable, so it
+         can be read and pasted rather than squinted at. -->
+    <div id="errBanner" style="display:none;margin:0 0 6px;padding:8px 11px;border-radius:6px;font-size:.68rem;line-height:1.55;background:rgba(127,29,29,.35);border:1px solid #b91c1c;color:#fecaca;user-select:text;white-space:pre-wrap;word-break:break-word"></div>
+    <div class="canvas-wrap">
+      <!-- The user guide. Plain markup rather than a fetched file: it is a few
+           KB, it must render before any network call, and a guide that can 404
+           is worse than no guide. Scrolls independently of the canvases. -->
+      <div id="guidePane" style="display:none;position:absolute;inset:0;overflow-y:auto;padding:22px 26px 40px;background:#0d0d0d;color:#d4d4d4;font-size:.78rem;line-height:1.6">
+        <div style="max-width:720px;margin:0 auto">
+          <h2 style="margin:0 0 6px;font-size:1.2rem;color:#fff">What CADAI is</h2>
+          <p style="margin:0 0 14px">CADAI is a web tool for anyone designing a mechanical part.
+            You upload the part, describe how it gets pushed or pulled, and it shows you
+            <b>where the part is under strain</b> — which areas are carrying the load and which are along
+            for the ride.</p>
+          <p style="margin:0 0 22px;color:#a3a3a3">It knows about 145 materials: aluminium and steel alloys,
+            titanium, plastics, 3D-printing filaments, composites and more. Nothing to install — it runs
+            in this browser tab.</p>
+
+          <h3 style="color:#fff;font-size:.95rem;margin:0 0 6px">Why you'd use it</h3>
+          <p style="margin:0 0 12px">When something pushes on a part, the force doesn't spread out evenly.
+            It travels along certain paths through the material, and everywhere else does comparatively little.
+            You usually can't tell which is which by looking at it.</p>
+          <p style="margin:0 0 22px">CADAI works it out and draws it: busy areas red, idle areas green.
+            That tells you whether a part is strong enough, where it would fail first, and whether you are
+            carrying material that isn't earning its place.</p>
+
+          <h3 style="color:#fff;font-size:.95rem;margin:22px 0 6px">Using it</h3>
+          <p style="margin:0 0 10px"><b>1. Give it a part.</b> Drag a STEP file onto the box at the top left.
+            (STEP is the standard export format from Onshape, SolidWorks, Fusion and the rest.)
+            No file handy? Click one of the example thumbnails.</p>
+          <p style="margin:0 0 10px"><b>2. Say how it's loaded.</b> In the "Load context" box, write it the way
+            you'd say it out loud:</p>
+          <p style="margin:0 0 10px;padding:8px 12px;background:#161616;border-left:2px solid #404040;color:#d4d4d4">
+            bolted at the left end, something presses down about 40 lb on the far end, 1/4 in 7075 plate</p>
+          <p style="margin:0 0 10px">Press <b>Read this &amp; set the fields below</b>. The boxes underneath will
+            change to match — that's how you know it understood. Anything it got wrong, type over.</p>
+          <p style="margin:0 0 22px"><b>3. Press Run.</b> Ten to thirty seconds. The tabs along the top switch
+            between the strain picture and a 3D view you can spin around.</p>
+
+          <h3 style="color:#fff;font-size:.95rem;margin:22px 0 6px">Lightening a part — optional</h3>
+          <p style="margin:0 0 12px">If your part is a flat plate, you can tick <b>Pocketing (2D plates)</b>
+            before running. CADAI will then go a step further and design cut-outs in the idle areas while
+            leaving the loaded ones intact. Machinists call this <i>pocketing</i>; done well the part comes out
+            noticeably lighter and just as stiff, and done by eye it's guesswork.</p>
+          <p style="margin:0 0 8px">You get a third tab with the plan on it:</p>
+          <p style="margin:0 0 8px"><span style="color:#4ade80">■</span> <b>Green</b> — cut this out.</p>
+          <p style="margin:0 0 8px"><span style="color:#f87171">■</span> <b>Red</b> — leave it, the force
+            travels here.</p>
+          <p style="margin:0 0 12px"><span style="color:#d4d4d4">■</span> <b>Grey</b> — the ribs and outer edge
+            that hold it together.</p>
+          <p style="margin:0 0 22px;color:#a3a3a3">Leave the box unticked and you simply get the strain picture,
+            which is all you need if you're checking a part rather than redesigning it. Parts that aren't flat
+            plates are analysed as solids and skip this step.</p>
+
+          <h3 style="color:#fff;font-size:.95rem;margin:22px 0 6px">If a coloured bar appears at the top</h3>
+          <p style="margin:0 0 22px">Something looks off — usually a number that doesn't match the part.
+            The bar says which box to check. Red is worth stopping for; amber just means the answer is a bit rough.</p>
+
+          <h3 style="color:#fff;font-size:.95rem;margin:22px 0 6px">Ask it questions</h3>
+          <p style="margin:0 0 22px">The panel on the right answers questions about CAD, machining and materials,
+            and shows where each answer came from. Try "how thick should a gusset be" or
+            "what's the difference between 6061 and 7075".</p>
+
+          <div style="background:rgba(127,29,29,.28);border:1px solid #b91c1c;border-radius:6px;padding:10px 13px;margin:26px 0 0;color:#fecaca">
+            <b>One important thing.</b> CADAI is a sanity check, not an approval. It works from a simplified version
+            of your part and ignores welds, bolts, sudden impacts and metal fatigue. A green picture means the
+            <i>simplified model</i> looks fine, which is not a promise about the real part. If it carries a load
+            that matters, have someone qualified check it before you build it.
+          </div>
+        </div>
+      </div>
+      <canvas id="cv" width="900" height="600"></canvas>
+      <!-- The plan view is a canvas, not the raw PNG: the labels have to stay
+           legible at any zoom, and a baked-in 10 px font does not. -->
+      <canvas id="cvp" width="900" height="600"></canvas>
+      <img id="pocketImg" style="display:none!important">
+      <canvas id="cv3d" width="900" height="600" style="display:none;cursor:grab;background:radial-gradient(circle at 50% 40%,#151515,#0d0d0d)"></canvas>
+      <div id="hint3d" style="position:absolute;left:12px;bottom:10px;display:none;font-size:.66rem;color:#737373;pointer-events:none">left-drag rotate · right-drag move · scroll zoom</div>
+      <div id="mapKey"><div class="ttl">STRUCTURAL STRESS MAP</div>
+        <div class="k"><i style="background:#00c846"></i><b>STRONG</b> — low stress, safe to pocket</div>
+        <div class="k"><i style="background:#eab308"></i><b>MODERATE</b> — watch under peak load</div>
+        <div class="k"><i style="background:#ff2b2b"></i><b>HIGH STRESS</b> — carries the load, keep material</div>
+        <div class="foot" id="mapKeyFoot"></div></div>
+      <div id="key3d" style="display:none"><div class="ttl">SOLID STRESS MAP — 3D FEA</div>
+        <div class="k"><i style="background:#00c846"></i><b>LOW</b> — carries little; material here is optional</div>
+        <div class="k"><i style="background:#eab308"></i><b>CAUTION</b> — real load, watch at peak</div>
+        <div class="k"><i style="background:#f97316"></i><b>HIGH</b> — main load path</div>
+        <div class="k"><i style="background:#ff2b2b"></i><b>CRITICAL</b> — highest stress on the surface</div>
+        <div class="foot" id="key3dFoot"></div></div>
+      <div id="pocketKey"><div class="ttl">STRESS MAP — MACHINING PLAN</div>
+        <div class="k"><i style="background:#1eb258"></i><b>POCKET</b> — machined out, full depth</div>
+        <div class="k"><i style="background:#c4342c"></i><b>SOLID</b> — peak load path, left full thickness</div>
+        <div class="k"><i style="background:#a8b2c8"></i><b>RIB / RIM</b> — one rib wide; doubled where stress is high</div>
+        <div class="k"><i class="ring" style="border-color:#f87171"></i><b>MOUNT HOLE</b> — boss collar, pockets stop at it</div>
+        <div class="k"><i class="ring" style="border-color:#fbbf24"></i><b>LARGE BORE</b> — bearing seat, collar kept solid</div>
+        <div class="foot" id="pocketKeyFoot"></div></div>
+      <div class="zoomer" id="zoomer">
+        <button onclick="zoomStep(1/1.3)" title="Zoom out">−</button>
+        <span class="lvl" id="zoomLvl">100%</span>
+        <button onclick="zoomStep(1.3)" title="Zoom in">+</button>
+        <button class="wide" onclick="zoomReset()" title="Fit the whole part">Fit</button>
+      </div>
+      <div id="tip"></div>
+      <!-- Sits where the real stress-map key sits, and is replaced by it the
+           moment a solve returns. Labelled hard, because a picture that looks
+           like an answer and is not one is the worst thing this screen could
+           show. -->
+      <div id="demoBadge"><b>EXAMPLE — NOT A SOLVE</b>
+        Illustration of what a finished map looks like: bending stress on a
+        cantilever, drawn, not computed. Load a part and press Run for a real
+        one.</div>
+      <div id="pocketNote" style="position:absolute;left:12px;right:12px;bottom:10px;display:none;font-size:.68rem;line-height:1.45;color:#d4d4d4;background:rgba(10,10,10,.85);border:1px solid #262626;border-radius:6px;padding:7px 10px;pointer-events:none"></div>
+    </div>
+    <div class="bar"><span>Low</span><div class="legend"></div><span>High von Mises</span>
+      <span id="meta" style="margin-left:auto"></span></div>
+    <div id="ticks" style="display:flex;font-size:.6rem;color:#737373;padding:0 0 6px 34px;letter-spacing:.02em"></div>
+  </div>
+
+  <div class="chat" id="chatPanel">
+    <div class="grip" id="chatGrip" title="Drag to resize the assistant panel"></div>
+    <h2>CADAIGPT
+      <button id="wideBtn" onclick="toggleWide()" title="Widen the panel so long answers fit">⇔ Wider</button>
+    </h2>
+    <div class="msgs" id="msgs"><div class="m a">CADAIGPT — ask about stress, CAD, machining, materials or FRC. Every answer cites its sources.</div></div>
+    <button class="jump" id="jumpBtn" onclick="$('msgs').scrollTop=1e9">↓ newest</button>
+    <div class="cin">
+      <textarea id="q" placeholder="e.g. 6061-T6 vs 7075-T6 aluminum?" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();ask()}"></textarea>
+      <button onclick="ask()">➤</button>
+    </div>
+  </div>
+
+<script>
+let fileData=null, lastData=null, view='stress';
+const $=id=>document.getElementById(id);
+// material list. Grouped, because the library is 145 entries deep once
+// Onshape's stock set is in it, and a flat alphabetical list buries the four
+// aluminium tempers a team actually orders under a wall of bronzes.
+let MATINFO={};   // esc() is declared further down; both uses here are async.
+fetch('/api/materials').then(r=>r.json()).then(d=>{
+  MATINFO=d.info||{};
+  const sel=$('material');
+  if(d.groups&&d.groups.length){
+    sel.innerHTML=d.groups.map(g=>
+      `<optgroup label="${esc(g.label)}">`+
+      g.items.map(m=>`<option${m===d.default?' selected':''}>${esc(m)}</option>`).join('')+
+      `</optgroup>`).join('');
+  }else{ // older server, flat list
+    sel.innerHTML=d.materials.map(m=>`<option${m===d.default?' selected':''}>${esc(m)}</option>`).join('');
+  }
+  sel.value=d.default;
+  matNote();
+});
+
+/* What the picked material actually is, in numbers.
+
+   This exists mainly because of one specific trap: "Nylon 6/6" and
+   "Nylon (FDM print)" are the same word to a human and a factor of two in
+   stiffness to the solver. Anything with an across-layer knock-down says so
+   here, in the panel, rather than quietly producing a smaller safety factor
+   the user cannot account for. */
+function matNote(){
+  const i=MATINFO[$('material').value], box=$('matNote');
+  if(!i){ box.style.display='none'; return; }
+  const rows=[`<b style="color:#d4d4d4">E ${i.E_GPa} GPa</b> · ν ${i.nu} · `+
+              (i.sy_MPa>0?`yield ${i.sy_MPa} MPa`:'no yield published')+
+              (i.rho?` · ${i.rho} kg/m³`:'')];
+  if(i.allowable_note)
+    rows.push(`<span style="color:#eab308">⚠ ${esc(i.allowable_note)}</span>`);
+  else if(i.allowable_MPa>0)
+    rows.push(`Safety factor measured against ${i.allowable_MPa} MPa.`);
+  if(i.note) rows.push(esc(i.note));
+  if(i.source&&i.source!=='built-in')
+    rows.push(`<span style="color:#737373">from the ${esc(i.source)} library</span>`);
+  box.innerHTML=rows.join('<br>');
+  box.style.display='block';
+}
+document.addEventListener('change',e=>{ if(e.target&&e.target.id==='material') matNote(); });
+
+/* A safety factor is a ratio, and a ratio is meaningless without its
+   denominator. When that denominator is anything other than the material's
+   published yield -- an ultimate-strength fallback, or a printed part's
+   across-layer allowable -- the result line says so, so nobody reads a
+   deliberately pessimistic SF as the solver being wrong. */
+function sfBasis(d){
+  if(!d.allowable_note||!d.safety_factor) return '';
+  return `<div style="font-size:.62rem;color:#eab308;margin-top:2px">`+
+         `vs ${(d.allowable_pa/1e6).toFixed(0)} MPa allowable — ${esc(d.allowable_note)}</div>`;
+}
+
+/* Where the two thresholds come from.
+
+   Below 1.0 the answer is not merely alarming, it is outside the model: this is
+   a linear-elastic solve with no plasticity, so once the material yields every
+   number on screen is an extrapolation past the solver's own domain. 1.2 is a
+   little above that cliff so the warning arrives before the cliff rather than
+   at it.
+
+   1.5 is the softer line -- roughly where a deliberately designed FRC part on a
+   known load lands. Between the two is "possible, but look again", which is a
+   different message from "this is almost certainly a typo", so it gets a
+   different colour and drops the accusatory sentence. */
+/* Degraded-mesh banner. Separate from updateSfWarn so a part can be flagged
+   for both at once without either message swallowing the other. */
+function updateMeshWarn(d){
+  const el=$('meshWarn'); if(!el) return;
+  const note = d && d.tessellation_note;
+  if(!note){ el.style.display='none'; el.innerHTML=''; return }
+  el.style.display='';
+  el.innerHTML='<b>Coarse mesh</b> — '+esc(note)+
+    '<br><span style="opacity:.85">Treat the removal figure as a floor rather than '+
+    'an answer; the finer mesh usually finds more. If this keeps happening the '+
+    'container is most likely short of memory.</span>';
+}
+
+/* Full-width, selectable, and it does NOT truncate. The sidebar keeps a one
+   line pointer so the eye still lands somewhere when the banner is scrolled
+   off the top. */
+function showError(msg, status, statusText){
+  const el=$('errBanner');
+  let text=String(msg==null?'':msg).trim();
+  // FastAPI's HTTPException arrives as {"detail":"..."} -- showing the raw JSON
+  // makes a readable sentence look like a stack trace, so unwrap it.
+  try{ const j=JSON.parse(text); if(j&&typeof j.detail==='string') text=j.detail }catch(e){}
+  // An EMPTY body is itself the diagnosis, so say what it means rather than
+  // shrugging. Every application-level failure in this app returns a sentence;
+  // nothing coming back at all means the request died underneath FastAPI --
+  // the container killed mid-request (out of memory is the usual cause), or
+  // the connection dropped. Printing the HTTP status is what separates those.
+  if(!text){
+    text = 'the server returned no message body.'
+         + (status ? ' HTTP ' + status + (statusText ? ' ' + statusText : '') : '')
+         + '\n\nAn empty response means the request died below the app, not inside it'
+         + ' — most often the container ran out of memory and was killed mid-solve.'
+         + ' Check the deploy used --memory 2Gi, then read the server log:'
+         + '\n  gcloud beta run services logs read cadai --region us-central1 --limit 40';
+  }
+  if(el){ el.style.display=''; el.textContent='Error — '+text; }
+  $('status').textContent='Error — see the red banner above the map';
+  try{ el.scrollIntoView({block:'nearest'}) }catch(e){}
+}
+function clearError(){ const el=$('errBanner'); if(el){ el.style.display='none'; el.textContent='' } }
+
+const SF_BAD = 1.2, SF_WATCH = 1.5;
+function updateSfWarn(d){
+  const el=$('sfWarn'); if(!el) return;
+  const sf = d && d.safety_factor;
+  if(!sf || sf>=SF_WATCH){ el.style.display='none'; el.innerHTML=''; return }
+  const bad = sf < SF_BAD;
+  // Utilisation is the reciprocal, and it is the number people actually reason
+  // with -- "99% of allowable" lands harder than "SF 1.01".
+  const util = Math.min(999, Math.round(100/sf));
+  el.style.display='';
+  el.style.background = bad ? 'rgba(127,29,29,.35)' : 'rgba(120,80,10,.28)';
+  el.style.border = '1px solid ' + (bad ? '#b91c1c' : '#a16207');
+  el.style.color = bad ? '#fecaca' : '#fde68a';
+  el.innerHTML =
+    '<b>'+(bad ? 'Check your inputs' : 'Tight result')+'</b> — SF '+sf.toFixed(2)+
+    '×, peak stress at '+util+'% of allowable.'+
+    (bad ? ' A result this close to yield is far more often a field that was never'+
+           ' set than a part that is really about to bend.' : '')+
+    '<br><span style="opacity:.85">Worth re-reading: <b>Load (N)</b>, '+
+    '<b>Thickness (mm)</b>, <b>Material</b>, <b>Span axis</b>. If you wrote a '+
+    'loading description, press <b>Read this &amp; set the fields below</b> so you '+
+    'can see what it changed before you trust this.</span>';
+}
+$('pocket').onchange=e=>{
+  $('pocketOpts').style.display=e.target.checked?'flex':'none';
+  // Unchecking "2D plate" on a loaded STEP → show the 3D solid automatically
+  if(!e.target.checked && (solid3d||mesh3d)) showView('3d');
+  else if(e.target.checked && lastData) showView('stress');
+  // Switching modes invalidates the other mode's answer; say what pressing
+  // Analyze will now do rather than leaving a stale caption on screen.
+  if(fileData) $('status').textContent = e.target.checked
+    ? 'Ready — Analyze will run the 2D plate solve + pocketing.'
+    : 'Ready — Analyze will run a full 3D solid stress map.';
+};
+$('fileInput').onchange=e=>{if(e.target.files[0])setFile(e.target.files[0])};
+const drop=$('drop');
+drop.ondragover=e=>{e.preventDefault();drop.style.borderColor='#8a8a8a'};
+drop.ondragleave=()=>drop.style.borderColor='#262626';
+drop.ondrop=e=>{e.preventDefault();drop.style.borderColor='#262626';if(e.dataTransfer.files[0])setFile(e.dataTransfer.files[0])};
+let mesh3d=null;
+function setFile(f){
+  fileData=f;$('fname').textContent='📎 '+f.name;$('run').disabled=false;
+  mesh3d=null; solid3d=null; $('tab3d').style.display='none';
+  const isStep=/\.(step|stp)$/i.test(f.name);
+  // Stale caption from the previous part is worse than none: it would claim
+  // the new file was measured when it hasn't been looked at yet.
+  $('thickNote').textContent=isStep?'measuring…'
+    :'a photo carries no thickness — set it yourself';
+  if(isStep){
+    $('tab3d').style.display=''; tessellate(f);   // load the real 3D solid
+    // "2D plate" unchecked → it's a 3D part, so show 3D automatically
+    // "2D plate" checked → it's a plate, keep the stress/pocketing view
+  }
+}
+
+/* ---- thickness readout ----------------------------------------------------
+   Exactly one function writes the Thickness box from a file, so the box, the
+   caption under it and the number the solver actually ran on cannot drift
+   apart. Everything that learns a thickness calls this and nothing else. */
+const STOCK=[[1.27,'0.050"'],[1.588,'1/16"'],[2.286,'0.090"'],[3.175,'1/8"'],
+             [4.763,'3/16"'],[6.35,'1/4"'],[7.938,'5/16"'],[9.525,'3/8"'],
+             [12.7,'1/2"'],[19.05,'3/4"']];
+function nearestStock(mm){
+  let best=null,bd=1e9;
+  for(const [v,n] of STOCK){const d=Math.abs(mm-v)/v; if(d<bd){bd=d;best=n}}
+  // 6% — loose enough for a real machined face, tight enough that 3/16" can
+  // never be reported as 1/8" (those are 50% apart).
+  return bd<0.06?best:null;
+}
+function setThickness(mm,why){
+  const n=$('thickNote');
+  if(mm==null||!(mm>0)){
+    // Null is a real answer, not a failure: a solid body has no one thickness.
+    if(n)n.textContent=(why&&mm===null)?why:'';
+    return '';
+  }
+  const v=Math.round(mm*1000)/1000;
+  $('thick').value=v;
+  const st=nearestStock(v);
+  const txt=v.toFixed(2)+' mm'+(st?' ≈ '+st+' stock':'')+' — '+why;
+  if(n)n.textContent=txt;
+  return ' · '+txt;
+}
+
+async function tessellate(f){
+  $('status').textContent='Tessellating STEP → 3D solid…';
+  const fd=new FormData(); fd.append('file',f);
+  try{
+    const r=await fetch('/api/tessellate',{method:'POST',body:fd});
+    if(!r.ok){$('status').textContent='3D: '+(await r.text());return}
+    mesh3d=await r.json();
+    // center + scale
+    const b=mesh3d.bbox, ctr=b.min.map((m,i)=>(m+b.max[i])/2), span=Math.max(...b.spans)||1;
+    mesh3d.ctr=ctr; mesh3d.span=span;
+    v3.rx=-0.5;v3.ry=0.6;v3.zoom=1;v3.panX=0;v3.panY=0;
+    // The file knows its own stock. Put it in the box NOW, on load, rather
+    // than after the solve: a 1/8" plate sitting next to a box that still
+    // reads 6.35 is indistinguishable from the tool having ignored the file,
+    // and the number is free here — the tessellation is already in hand.
+    const tnote=setThickness(mesh3d.thickness_mm,'measured from this STEP');
+    $('status').textContent=`3D solid ready — ${mesh3d.n_tris.toLocaleString()} triangles${mesh3d.is_plate?' (plate)':' (3D part)'}${tnote}`;
+    // Auto-open the 3D view when the part isn't a 2D plate (box unchecked, or the
+    // STEP's bounding box says it's a solid).
+    if(!$('pocket').checked || !mesh3d.is_plate){ showView('3d'); }
+    else if(view==='3d') render3d();
+  }catch(e){$('status').textContent='3D error: '+e.message}
+}
+
+function showView(v){
+  view=v;
+  $('tabStress').classList.toggle('on',v==='stress');
+  $('tabPocket').classList.toggle('on',v==='pocket');
+  $('tab3d').classList.toggle('on',v==='3d');
+  $('tabGuide').classList.toggle('on',v==='guide');
+  // The guide covers the canvases entirely, so everything that draws or
+  // annotates has to be hidden while it is up -- including the demo badge and
+  // the zoomer, which would otherwise float over the text.
+  const guide = (v==='guide');
+  $('guidePane').style.display = guide ? 'block' : 'none';
+  // The colour ramp along the bottom describes the stress map. Under the
+  // guide it is a legend for nothing, and on a phone it eats a tenth of the
+  // screen saying so.
+  const barEl = document.querySelector('.bar');
+  if(barEl) barEl.style.display = guide ? 'none' : 'flex';
+  if(guide){
+    ['pocketNote','mapKey','pocketKey','key3d','tip','zoomer','demoBadge','hint3d']
+      .forEach(id=>{ const e=$(id); if(e) e.style.display='none' });
+    ['cv','cvp','cv3d'].forEach(id=>{ const e=$(id); if(e) e.style.display='none' });
+    return;
+  }
+  $('cv').style.display=v==='stress'?'block':'none';
+  $('cvp').style.display=v==='pocket'?'block':'none';
+  $('cv3d').style.display=v==='3d'?'block':'none';
+  $('hint3d').style.display=v==='3d'?'block':'none';
+  if(lastData)$('pocketNote').innerHTML=
+    (v==='pocket'?(lastData._pocketNote||''):(v==='stress'?(lastData._stressNote||''):''));
+  $('pocketNote').style.display=
+    ((v==='pocket'||v==='stress')&&$('pocketNote').textContent)?'block':'none';
+  $('mapKey').style.display=(v==='stress'&&lastData)?'block':'none';
+  $('pocketKey').style.display=(v==='pocket'&&lastData)?'block':'none';
+  $('key3d').style.display=(v==='3d'&&solid3d)?'block':'none';
+  if(v!=='stress'&&v!=='3d')$('tip').style.display='none';
+  if(v==='3d')$('tip').style.display='none';
+  if(v==='stress'&&lastData)render(lastData);
+  if(v==='pocket'&&lastData)renderPocket(lastData);
+  if(v==='3d'&&(solid3d||mesh3d))render3d();
+  // The 3D view has its own trackball, so the zoomer only belongs to the two
+  // flat canvases. Each keeps its own transform: zooming into a fillet on the
+  // stress map and then flipping to the pocket plan should not throw away
+  // where you were on either one.
+  $('zoomer').style.display=((v==='stress'||v==='pocket')&&lastData)?'flex':'none';
+  applyZoom();
+  legendFor(v);
+}
+
+/* ---- zoom / pan on the two flat canvases -------------------------------
+   Implemented as a CSS transform rather than a re-render at a bigger bitmap.
+   The field carries exactly one value per image pixel, so redrawing it larger
+   would invent detail the solve does not have -- a browser's own smooth
+   upscale is the honest picture. It also keeps every hit test correct for
+   free: getBoundingClientRect() reports the TRANSFORMED box, so the existing
+   cursor -> field-pixel arithmetic in hookHover() needs no change at all.  */
+const Z={stress:{k:1,tx:0,ty:0},pocket:{k:1,tx:0,ty:0}};
+const ZMIN=1, ZMAX=8;
+function zEl(){return view==='pocket'?$('cvp'):view==='stress'?$('cv'):null;}
+function zSt(){return Z[view]||null;}
+function zClamp(){
+  // Pan is bounded so the part can never be dragged off screen. At scale k the
+  // canvas overhangs its box by (k-1)/2 of its own size on each side, and that
+  // overhang is exactly how far there is to travel.
+  const el=zEl(),z=zSt(); if(!el||!z)return;
+  const mx=Math.max(0,(z.k-1)*el.offsetWidth/2), my=Math.max(0,(z.k-1)*el.offsetHeight/2);
+  z.tx=Math.max(-mx,Math.min(mx,z.tx)); z.ty=Math.max(-my,Math.min(my,z.ty));
+}
+function applyZoom(){
+  const el=zEl(),z=zSt(); if(!el||!z)return;
+  zClamp();
+  el.style.transform='translate('+z.tx.toFixed(1)+'px,'+z.ty.toFixed(1)+'px) scale('+z.k.toFixed(3)+')';
+  el.classList.toggle('grab',z.k>1.001);
+  if(z.k<=1.001)el.classList.remove('grabbing');
+  const lvl=$('zoomLvl'); if(lvl)lvl.textContent=Math.round(z.k*100)+'%';
+}
+function zoomTo(k,qx,qy){
+  // Zoom about a point: keep the field pixel under (qx,qy) pinned there. With
+  // transform-origin at the element's centre C, the offset a point keeps is
+  //   t' = (q-C) - (k'/k)*((q-C) - t)
+  const el=zEl(),z=zSt(); if(!el||!z)return;
+  const k2=Math.max(ZMIN,Math.min(ZMAX,k));
+  if(qx==null){ // no anchor given: zoom about the centre
+    z.tx*=k2/z.k; z.ty*=k2/z.k;
+  }else{
+    const cx=el.offsetLeft+el.offsetWidth/2, cy=el.offsetTop+el.offsetHeight/2;
+    const dx=qx-cx, dy=qy-cy, r=k2/z.k;
+    z.tx=dx-r*(dx-z.tx); z.ty=dy-r*(dy-z.ty);
+  }
+  z.k=k2;
+  if(z.k<=1.001){z.k=1;z.tx=0;z.ty=0;}
+  applyZoom();
+}
+function zoomStep(f){const z=zSt(); if(z)zoomTo(z.k*f);}
+function zoomReset(){const z=zSt(); if(!z)return; z.k=1;z.tx=0;z.ty=0; applyZoom();}
+
+let panning=false;
+(function hookZoom(){
+  const drag={on:false,x:0,y:0};
+  for(const id of ['cv','cvp']){
+    const el=$(id); if(!el)continue;
+    el.addEventListener('wheel',e=>{
+      if(view==='3d')return;
+      e.preventDefault();
+      const z=zSt(); if(!z)return;
+      // Anchor on the cursor, expressed in the wrap's coordinates -- the wrap
+      // is position:relative, so it is the canvas's offsetParent and the two
+      // agree without any further conversion.
+      const wr=el.parentElement.getBoundingClientRect();
+      zoomTo(z.k*(e.deltaY<0?1.16:1/1.16), e.clientX-wr.left, e.clientY-wr.top);
+    },{passive:false});
+    el.addEventListener('mousedown',e=>{
+      const z=zSt(); if(!z||z.k<=1.001)return;
+      drag.on=true; panning=true; drag.x=e.clientX; drag.y=e.clientY;
+      el.classList.add('grabbing'); $('tip').style.display='none';
+      e.preventDefault();
+    });
+    el.addEventListener('dblclick',e=>{
+      const z=zSt(); if(!z)return;
+      const wr=el.parentElement.getBoundingClientRect();
+      if(z.k>1.001)zoomReset();
+      else zoomTo(2.5,e.clientX-wr.left,e.clientY-wr.top);
+    });
+  }
+  window.addEventListener('mousemove',e=>{
+    if(!drag.on)return;
+    const z=zSt(); if(!z){drag.on=false;return;}
+    z.tx+=e.clientX-drag.x; z.ty+=e.clientY-drag.y;
+    drag.x=e.clientX; drag.y=e.clientY; applyZoom();
+  });
+  window.addEventListener('mouseup',()=>{
+    if(!drag.on)return; drag.on=false; panning=false;
+    const el=zEl(); if(el)el.classList.remove('grabbing');
+  });
+  window.addEventListener('keydown',e=>{
+    if(view==='3d')return;
+    if(e.target&&/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName))return;
+    if(e.key==='+'||e.key==='=')zoomStep(1.3);
+    else if(e.key==='-'||e.key==='_')zoomStep(1/1.3);
+    else if(e.key==='0')zoomReset();
+  });
+})();
+
+/* ---- interactive 3D solid renderer (painter's algorithm + lighting) ---- */
+const v3={rx:-0.5,ry:0.6,zoom:1,panX:0,panY:0,drag:false,mode:'rot',lx:0,ly:0};
+// Result of /api/analyze3d: the same surface the tessellator draws, but with a
+// von Mises value per vertex. When it's present it replaces the grey preview,
+// so the 3D tab shows the answer rather than just the shape.
+let solid3d=null;
+const BAND3D={critical:'#ff2b2b',high:'#f97316',caution:'#eab308',low:'#22c55e'};
+let _proj3d=null;   // screen positions of the callouts, for hover
+function render3d(){
+  const src=solid3d||mesh3d; if(!src)return;
+  const cv=$('cv3d'),ctx=cv.getContext('2d');
+  const wrap=cv.parentElement; const W=cv.width=wrap.clientWidth,H=cv.height=wrap.clientHeight;
+  ctx.clearRect(0,0,W,H);
+  const verts=solid3d?solid3d.verts:null;
+  const tris=src.tris, vn=solid3d?solid3d.vnorm:null;
+  const ctr=src.ctr, span=src.span;
+  const crx=Math.cos(v3.rx),srx=Math.sin(v3.rx),cry=Math.cos(v3.ry),sry=Math.sin(v3.ry);
+  const rot=p=>{let dx=(p[0]-ctr[0])/span,dy=(p[1]-ctr[1])/span,dz=(p[2]-ctr[2])/span;
+    let x1=dx*cry+dz*sry, z1=-dx*sry+dz*cry, y2=dy*crx-z1*srx, z2=dy*srx+z1*crx; return[x1,y2,z2];};
+  const sc=Math.min(W,H)*0.7*v3.zoom, ox=W/2+v3.panX, oy=H/2+v3.panY;
+  // The solved payload indexes into a vertex array; the raw tessellation stores
+  // three points per triangle. One rotate pass either way, then the same
+  // painter's-algorithm shading.
+  const faces=tris.map((t)=>{
+    const p=verts?[rot(verts[t[0]]),rot(verts[t[1]]),rot(verts[t[2]])]:t.map(rot);
+    const z=(p[0][2]+p[1][2]+p[2][2])/3;
+    const ux=p[1][0]-p[0][0],uy=p[1][1]-p[0][1],uz=p[1][2]-p[0][2],
+          vx=p[2][0]-p[0][0],vy=p[2][1]-p[0][1],vz=p[2][2]-p[0][2];
+    let nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx;const nl=Math.hypot(nx,ny,nz)||1;
+    // Flat-shade each facet at the mean of its three nodal values. Canvas has no
+    // Gouraud fill, and at ~6000 facets each one is a couple of pixels across,
+    // so the banding does not read.
+    const sv=vn?(vn[t[0]]+vn[t[1]]+vn[t[2]])/3:-1;
+    return{p,z,nz:nz/nl,s:sv};});
+  faces.sort((a,b)=>a.z-b.z);
+  for(const f of faces){
+    const sh=0.35+0.65*Math.abs(f.nz*0.85);
+    let r,g,b;
+    if(f.s>=0){const c=stressColor(f.s);
+      // Keep the hue, let the lighting move the value only: a red facet turned
+      // away from the light must still read red, or the shading invents cool
+      // spots the solver never found.
+      const lit=0.45+0.55*sh; r=c[0]*lit|0; g=c[1]*lit|0; b=c[2]*lit|0;}
+    else {r=150*sh+30|0; g=157*sh+30|0; b=174*sh+30|0;}
+    const s0=f.p[0],s1=f.p[1],s2=f.p[2];ctx.beginPath();
+    ctx.moveTo(s0[0]*sc+ox,-s0[1]*sc+oy);ctx.lineTo(s1[0]*sc+ox,-s1[1]*sc+oy);ctx.lineTo(s2[0]*sc+ox,-s2[1]*sc+oy);
+    ctx.closePath();ctx.fillStyle='rgb('+r+','+g+','+b+')';ctx.fill();}
+
+  _proj3d=[];
+  if(solid3d&&solid3d.callouts){
+    // Depth-sorted, and the ones round the back are dimmed: a marker floating
+    // over the near face when it actually sits on the far one is a lie about
+    // where the stress is.
+    const cs=solid3d.callouts.map(c=>{const q=rot([c.x,c.y,c.z]);
+      return{c:c,sx:q[0]*sc+ox,sy:-q[1]*sc+oy,z:q[2]};}).sort((a,b)=>a.z-b.z);
+    for(const m of cs){
+      const col=BAND3D[m.c.band]||'#a3a3a3', hot=m.c.kind==='hot', far=m.z<0;
+      ctx.globalAlpha=far?0.4:1;
+      ctx.beginPath();ctx.arc(m.sx,m.sy,hot?6:4.5,0,6.2832);
+      ctx.fillStyle=col;ctx.fill();
+      ctx.lineWidth=1.6;ctx.strokeStyle='rgba(5,8,14,.9)';ctx.stroke();
+      if(hot&&!far){ctx.globalAlpha=.30;ctx.beginPath();ctx.arc(m.sx,m.sy,12,0,6.2832);
+        ctx.strokeStyle=col;ctx.lineWidth=2;ctx.stroke();}
+      ctx.globalAlpha=1;
+      m.r=hot?11:9; _proj3d.push(m);
+    }
+  }
+  ctx.fillStyle=solid3d?'#fafafa':'#34d399';ctx.font='bold 11px monospace';
+  ctx.fillText(solid3d?'SOLID STRESS MAP - 3D FEA':'3D SOLID (STEP)',14,20);
+  ctx.fillStyle='#737373';ctx.font='9px sans-serif';
+  ctx.fillText(solid3d
+    ? solid3d.n_elems.toLocaleString()+' tets · '+solid3d.element+' · peak '+(solid3d.peak_vm/1e6).toFixed(1)+' MPa'
+    : mesh3d.n_tris.toLocaleString()+' triangles',14,36);
+}
+(function(){const cv=$('cv3d');
+  cv.addEventListener('mousedown',e=>{v3.drag=true;v3.mode=(e.button===2||e.shiftKey)?'pan':'rot';v3.lx=e.clientX;v3.ly=e.clientY;cv.style.cursor=v3.mode==='pan'?'move':'grabbing';});
+  cv.addEventListener('contextmenu',e=>e.preventDefault());
+  window.addEventListener('mouseup',()=>{v3.drag=false;cv.style.cursor='grab';});
+  window.addEventListener('mousemove',e=>{if(!v3.drag||view!=='3d')return;const dx=e.clientX-v3.lx,dy=e.clientY-v3.ly;
+    if(v3.mode==='pan'){v3.panX+=dx;v3.panY+=dy;}else{v3.ry+=dx*0.01;v3.rx+=dy*0.01;}v3.lx=e.clientX;v3.ly=e.clientY;render3d();});
+  cv.addEventListener('wheel',e=>{if(view!=='3d')return;e.preventDefault();v3.zoom=Math.max(0.3,Math.min(4,v3.zoom*(e.deltaY<0?1.1:0.9)));render3d();},{passive:false});
+  // Hover readout. Nearest marker within its own radius wins, and near markers
+  // beat far ones at equal distance so a back-face point never steals a hover
+  // from the surface you are actually looking at.
+  cv.addEventListener('mousemove',e=>{
+    if(view!=='3d'||v3.drag||!_proj3d||!_proj3d.length){hide3dTip();return}
+    const b=cv.getBoundingClientRect(), mx=e.clientX-b.left, my=e.clientY-b.top;
+    let best=null,bd=1e9;
+    for(const m of _proj3d){const d=Math.hypot(mx-m.sx,my-m.sy)-(m.z<0?3:0);
+      if(d<m.r&&d<bd){bd=d;best=m}}
+    if(!best){hide3dTip();return}
+    const c=best.c, t=$('tip'), mpa=(c.pct*(solid3d.scale_ref_vm||0)/1e6);
+    const words={critical:'CRITICAL — the highest stress on this part',
+                 high:'HIGH — a main load path',
+                 caution:'CAUTION — carrying real load',
+                 low:'LOW — barely loaded'}[c.band]||c.band;
+    t.innerHTML='<b style="color:'+(BAND3D[c.band]||'#a3a3a3')+'">'+words+'</b><br>'
+      +'σ ≈ '+(c.vm!=null?(c.vm/1e6).toFixed(1):mpa.toFixed(1))+' MPa · '
+      +Math.round(c.pct*100)+'% of scale<br>'
+      +'<span style="color:#737373">at ('+c.x.toFixed(1)+', '+c.y.toFixed(1)+', '+c.z.toFixed(1)+') mm'
+      +(best.z<0?' — on the far face':'')+'</span>';
+    t.style.display='block';t.style.left=(best.sx+16)+'px';t.style.top=(best.sy-8)+'px';
+  });
+  cv.addEventListener('mouseleave',hide3dTip);
+})();
+function hide3dTip(){if(view==='3d')$('tip').style.display='none'}
+function stressColor(v){const s=[[0,[0,200,70]],[.25,[120,210,0]],[.5,[234,179,8]],[.75,[249,115,22]],[1,[255,0,0]]];
+  for(let i=1;i<s.length;i++)if(v<=s[i][0]){const[a,ca]=s[i-1],[b,cb]=s[i],t=(v-a)/(b-a||1);return ca.map((c,j)=>Math.round(c+(cb[j]-c)*t))}return[255,0,0]}
+
+/* ---- solid (3D) stress map — the path taken when "2D plate" is off ---- */
+async function analyze3d(){
+  $('run').disabled=true;
+  // Clear it up front. A stale banner from the previous part sitting over a
+  // fresh solve is worse than no banner at all.
+  updateSfWarn(null); updateMeshWarn(null); clearError();
+  $('status').textContent='Meshing the solid + running 3D FEA… (this takes ~10–20 s)';
+  const fd=new FormData();
+  fd.append('file',fileData);
+  fd.append('material',$('material').value);
+  fd.append('mode',$('mode').value);
+  fd.append('load_case',$('loadCase').value);
+  fd.append('orientation',$('orientation').value);
+  fd.append('load',$('load').value);
+  fd.append('thickness_mm_in',$('thick').value||0);
+  fd.append('load_context',$('loadCtx').value);
+  try{
+    const r=await fetch('/api/analyze3d',{method:'POST',body:fd});
+    if(!r.ok){showError(await r.text(), r.status, r.statusText);return}
+    const d=await r.json();
+    const b=d.bbox, ctr=b.min.map((m,i)=>(m+b.max[i])/2);
+    d.ctr=ctr; d.span=Math.max(...b.spans)||1;
+    solid3d=d;
+    // A STEP solve is run on the real solid, so this is a readout rather than
+    // an input — but it still has to agree with the box, or the box is lying.
+    setThickness(d.thickness_mm, d.thickness_source||'measured from this STEP');
+    // An image part has no tessellated preview, so the tab only exists once the
+    // solve gives it something to draw.
+    $('tab3d').style.display='';
+    const sf=d.safety_factor?(' · SF '+d.safety_factor.toFixed(1)+'×'):'';
+    $('metaTop').textContent=`${d.material} · ${d.mode} · solid 3D`;
+    $('meta').innerHTML=`peak σ ${(d.peak_vm/1e6).toFixed(2)} MPa${sf}`+sfBasis(d);
+    updateSfWarn(d);
+    updateMeshWarn(d);
+    $('status').textContent=
+      `${d.n_nodes.toLocaleString()} nodes · ${d.n_elems.toLocaleString()} tets · ${d.element}`
+      +` · ${d.linear_solver} · max deflection ${(d.max_disp_m*1000).toFixed(2)} mm`;
+    $('key3dFoot').innerHTML=
+      esc(d.geometry_source)+'<br>loaded '+esc(d.load_dir_name)
+      +' · '+esc(d.load_case)
+      +(d.singular_nodes_excluded?'<br>'+d.singular_nodes_excluded
+        +' nodes at the clamp left out of the colour scale':'');
+    drawLegend(d);
+    showView('3d');
+  }catch(e){showError(e.message||String(e), 0, e.name||'')}
+  finally{$('run').disabled=false}
+}
+
+async function analyze(){
+  if(!fileData)return;
+  // Unchecked "Pocketing (2D plates)" means the part is not a plate, so it gets
+  // a real volume solve rather than a plane-stress one painted onto a 3D shape.
+  if(!$('pocket').checked){ return analyze3d(); }
+  solid3d=null;
+  $('run').disabled=true; updateSfWarn(null); updateMeshWarn(null); clearError(); $('status').textContent='Meshing + solving…';
+  const fd=new FormData();
+  fd.append('file',fileData);
+  fd.append('material',$('material').value);
+  fd.append('mode',$('mode').value);
+  fd.append('load_case',$('loadCase').value);
+  fd.append('orientation',$('orientation').value);
+  fd.append('load',$('load').value);
+  fd.append('pocketing',$('pocket').checked);
+  fd.append('rib_mm',$('rib').value);
+  fd.append('density',$('density').value);
+  fd.append('thickness_mm_in',$('thick').value||0);
+  // The text goes to the server too: whatever it states beats the dropdowns,
+  // so running without pressing "Read this" first still honours what you wrote.
+  fd.append('load_context',$('loadCtx').value);
+  try{
+    const r=await fetch('/api/analyze',{method:'POST',body:fd});
+    if(!r.ok){showError(await r.text(), r.status, r.statusText);return}
+    const d=await r.json(); lastData=d;
+    // Reflect what the solver used, not what was typed. On a STEP these differ
+    // whenever the file disagrees with the box, and the file wins.
+    setThickness(d.thickness_mm, d.thickness_source||'used for this solve');
+    render(d);
+    if(d.pocket_png_data){
+      const im=$('pocketImg');
+      // decode before drawing: a canvas drawImage of a half-loaded <img> is a
+      // silent blank, not an error
+      im.onload=()=>{if(view==='pocket')renderPocket(d)};
+      im.src=d.pocket_png_data;
+      $('tabPocket').style.display='';
+    }
+    // Both captions are built now and stashed on the payload: showView() has to
+    // be able to swap between them on a tab click without re-solving.
+    d._pocketNote=pocketNoteHTML(d);
+    d._stressNote=stressNoteHTML(d);
+    const sf=d.safety_factor?(' · SF '+d.safety_factor.toFixed(1)+'×'):'';
+    let saved=''; if(d.saved&&d.saved.dir)saved=' · 💾 '+d.saved.dir.split(/[\\/]/).slice(-1)[0];
+    const fem=`${d.element||'P1'}${d.adaptive_pass?' · adaptive':''}`;
+    $('status').textContent=`${d.n_nodes} nodes · ${d.n_elems} elems · ${fem} · ${d.holes} holes${d.pocketing?(' · '+d.pocketing.n_pockets+' pockets ('+Math.round(d.pocketing.removable_frac*100)+'% off, '+d.pocketing.pattern+')'):''}${saved}`;
+    $('metaTop').textContent=`${d.material} · ${d.mode}`;
+    $('meta').innerHTML=`peak σ ${(d.peak_vm/1e6).toFixed(2)} MPa${sf}`+sfBasis(d);
+    updateSfWarn(d);
+    updateMeshWarn(d);
+    drawLegend(d);
+    showView(d.pocket_png_data?'pocket':'stress');
+  }catch(e){showError(e.message||String(e), 0, e.name||'')}
+  finally{$('run').disabled=false}
+}
+/* ---- load context: plain English → the fields below ---- */
+const CTX_LABEL={load_case:'load case',orientation:'load axis',load:'load',
+  mode:'mode',thickness_mm:'thickness',material:'material'};
+async function parseCtx(){
+  const text=$('loadCtx').value.trim();
+  const out=$('ctxOut'), btn=$('ctxBtn');
+  if(!text){out.innerHTML='<span class="guess">Write how the part is held and what pushes on it.</span>';return}
+  btn.disabled=true; out.textContent='Reading…';
+  try{
+    const r=await fetch('/api/parse_load',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
+    const d=await r.json();
+    if(!d.ok){out.innerHTML='<span class="guess">'+esc(d.error||'Nothing usable in that description.')+'</span>';return}
+    const s=d.settings;
+    $('loadCase').value=s.load_case;
+    $('orientation').value=s.orientation;
+    $('load').value=(+s.load).toFixed(2).replace(/\.00$/,'');
+    $('mode').value=s.mode;
+    setThickness(s.thickness_mm,'read from your description'
+      +((d.assumed||[]).includes('thickness_mm')?' (assumed — it didn\'t say)':''));
+    if([...$('material').options].some(o=>o.value===s.material))$('material').value=s.material;
+    // Say which values came from the sentence and which were filled in, so a
+    // misreading is caught here rather than after a wrong answer.
+    const from=(d.from_text||[]).map(k=>CTX_LABEL[k]||k);
+    const guess=(d.assumed||[]).map(k=>CTX_LABEL[k]||k);
+    let h='<b style="color:#e6e6e6">'+esc(d.understood)+'</b>';
+    if(from.length)h+='<br><span class="hit">✓ from your text:</span> '+esc(from.join(', '));
+    if(guess.length)h+='<br><span class="guess">? assumed:</span> '+esc(guess.join(', '))+' — set them yourself if that\'s wrong';
+    if((d.detail||[]).length)h+='<br><span style="color:#737373">'+d.detail.map(esc).join(' · ')+'</span>';
+    out.innerHTML=h;
+  }catch(e){out.innerHTML='<span class="guess">'+esc(e.message)+'</span>'}
+  finally{btn.disabled=false}
+}
+const esc=t=>String(t==null?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+
+function drawLegend(d){
+  const el=$('ticks'); if(!el) return;
+  const r=d.ramp_vm;
+  if(!r||!r.length){el.textContent='';return}
+  // The colour ramp is spread by a gamma so the whole range is usable; these
+  // are the true MPa values sitting under each ramp stop, so the picture is
+  // readable without the numbers becoming a lie.
+  const f=v=>v>=100?v.toFixed(0):v>=10?v.toFixed(1):v.toFixed(2);
+  el.innerHTML=r.map((v,i)=>`<span style="flex:1;text-align:${i===0?'left':i===r.length-1?'right':'center'}">${f(v/1e6)}</span>`).join('')
+    +`<span style="margin-left:8px;color:#475569">MPa${d.singular_nodes_excluded?' · '+d.singular_nodes_excluded+' clamp nodes excluded from scale':''}</span>`;
+  // Mark the two cut lines on the same bar, because this bar IS the pocketing
+  // input: everything left of "pocket" is material the engine takes out.
+  const bar=document.querySelector('.legend'), t=d.pocket_thresholds;
+  bar.style.position='relative';
+  bar.querySelectorAll('.cut').forEach(x=>x.remove());
+  document.querySelectorAll('.bar .cutkey').forEach(x=>x.remove());
+  if(t){
+    for(const [k,col] of [['pocket','#0a0e16'],['keep','#fafafa']]){
+      const s=document.createElement('span');
+      s.className='cut';
+      s.title=(k==='pocket'?'below here the engine pockets':'above here it keeps solid material')
+        +` (${t[k].toFixed(2)} of scale)`;
+      s.style.cssText=`position:absolute;top:-2px;bottom:-2px;width:2px;background:${col};left:${(t[k]*100).toFixed(1)}%`;
+      bar.appendChild(s);
+    }
+    $('meta').insertAdjacentHTML('beforebegin',
+      `<span class="cutkey" style="color:#737373">pocket &lt; ${t.pocket.toFixed(2)} · keep &gt; ${t.keep.toFixed(2)}</span>`);
+  }
+}
+/* ==================== stress map ====================
+   The field painted here is von_mises_norm — byte for byte the array the
+   pocketing engine thresholds against. Green is material the engine will cut,
+   red is material it keeps, so the picture explains the plan rather than
+   sitting beside it.
+
+   Drawn per pixel with barycentric interpolation instead of one flat colour
+   per triangle: a flat fill shows you the mesh, and the mesh is an artifact of
+   the solver, not a property of your part. The same pass fills a lookup buffer
+   so hovering can answer in true MPa without re-searching the mesh.        */
+let _LUT=null;
+function colorLUT(){
+  if(_LUT)return _LUT;
+  _LUT=new Uint8Array(768);
+  for(let i=0;i<256;i++){const c=stressColor(i/255);_LUT[i*3]=c[0];_LUT[i*3+1]=c[1];_LUT[i*3+2]=c[2]}
+  return _LUT;
+}
+const RB={W:0,H:0,fn:null,fl:null,mask:null};   // raster buffers, reused on hover
+
+function rasterField(d,W,H){
+  const n=d.nodes,tris=d.tris,vn=d.von_mises_norm,
+        vl=d.von_mises_pct||d.von_mises_linear||d.von_mises_norm;
+  const px=new Uint8ClampedArray(W*H*4), fn=new Float32Array(W*H),
+        fl=new Float32Array(W*H), mask=new Uint8Array(W*H), lut=colorLUT();
+  const EPS=-0.0015;   // a hair of overlap so seams between triangles don't show
+  for(const t of tris){
+    const a=n[t[0]],b=n[t[1]],c=n[t[2]];
+    const x0=Math.max(0,Math.floor(Math.min(a[0],b[0],c[0]))),
+          x1=Math.min(W-1,Math.ceil(Math.max(a[0],b[0],c[0]))),
+          y0=Math.max(0,Math.floor(Math.min(a[1],b[1],c[1]))),
+          y1=Math.min(H-1,Math.ceil(Math.max(a[1],b[1],c[1])));
+    if(x1<x0||y1<y0)continue;
+    const det=(b[1]-c[1])*(a[0]-c[0])+(c[0]-b[0])*(a[1]-c[1]);
+    if(!det)continue;
+    const na=vn[t[0]],nb=vn[t[1]],nc=vn[t[2]],la=vl[t[0]],lb=vl[t[1]],lc=vl[t[2]];
+    for(let y=y0;y<=y1;y++){
+      for(let x=x0;x<=x1;x++){
+        const w0=((b[1]-c[1])*(x-c[0])+(c[0]-b[0])*(y-c[1]))/det; if(w0<EPS)continue;
+        const w1=((c[1]-a[1])*(x-c[0])+(a[0]-c[0])*(y-c[1]))/det; if(w1<EPS)continue;
+        const w2=1-w0-w1; if(w2<EPS)continue;
+        const i=y*W+x, v=w0*na+w1*nb+w2*nc;
+        fn[i]=v; fl[i]=w0*la+w1*lb+w2*lc; mask[i]=1;
+        const k=((v<0?0:v>1?1:v)*255|0)*3, o=i<<2;
+        px[o]=lut[k];px[o+1]=lut[k+1];px[o+2]=lut[k+2];px[o+3]=255;
+      }
+    }
+  }
+  RB.W=W;RB.H=H;RB.fn=fn;RB.fl=fl;RB.mask=mask;
+  return new ImageData(px,W,H);
+}
+
+/* Outer silhouette and every bore, straight off the mesh: an edge used by one
+   triangle is a boundary edge. Stroking these hides the rasteriser's stair-steps
+   and makes the bores read as holes rather than as dark blobs. */
+function boundaryLoops(d){
+  if(d._loops)return d._loops;
+  const cnt=new Map();
+  for(const t of d.tris){
+    for(let e=0;e<3;e++){
+      const p=t[e],q=t[(e+1)%3],k=p<q?p*1e7+q:q*1e7+p;
+      cnt.set(k,(cnt.get(k)||0)+1);
+    }
+  }
+  const adj=new Map();
+  for(const[k,c]of cnt){
+    if(c!==1)continue;
+    const p=Math.floor(k/1e7),q=k%1e7;
+    if(!adj.has(p))adj.set(p,[]); if(!adj.has(q))adj.set(q,[]);
+    adj.get(p).push(q); adj.get(q).push(p);
+  }
+  const seen=new Set(),loops=[];
+  for(const start of adj.keys()){
+    if(seen.has(start))continue;
+    const loop=[]; let cur=start,prev=-1;
+    while(cur!==undefined&&!seen.has(cur)){
+      seen.add(cur); loop.push(cur);
+      let nxt;
+      for(const v of adj.get(cur)||[]) if(v!==prev&&!seen.has(v)){nxt=v;break}
+      prev=cur; cur=nxt;
+    }
+    if(loop.length>3)loops.push(loop);
+  }
+  d._loops=loops; return loops;
+}
+
+/* One badge colour per stress band, not one per sign. A part is not simply
+   "weak here, strong there": between the two there is a transition zone that a
+   machinist has to know about, because it is the material that looks free on a
+   two-colour map and is not. The solver already bands every callout, so the
+   badge just wears the band's own colour and says its name. */
+const BAND_NAME={critical:'CRITICAL',high:'HIGH',caution:'CAUTION',
+                 low:'STRONG',safe:'STRONG'};
+const BAND_COL={
+  critical:{dot:'#fca5a5',line:'rgba(252,165,165,.8)',fill:'rgba(104,14,22,.94)',txt:'#fecaca'},
+  high    :{dot:'#fdba74',line:'rgba(253,186,116,.8)',fill:'rgba(97,44,8,.94)', txt:'#fed7aa'},
+  caution :{dot:'#fde047',line:'rgba(253,224,71,.75)',fill:'rgba(74,58,6,.94)', txt:'#fef08a'},
+  low     :{dot:'#86efac',line:'rgba(134,239,172,.7)',fill:'rgba(14,64,40,.93)',txt:'#bbf7d0'}};
+BAND_COL.safe=BAND_COL.low;   // the solver calls it "low"; the badge says STRONG
+const bandOf=m=>BAND_COL[m.band]||BAND_COL[m.kind==='hot'?'high':'low'];
+
+/* Where the interesting points actually are. Hot spots come from the solved
+   field, not from guessing at the geometry, and are spaced apart so three
+   badges don't stack on one hole. The strong marker goes to the low-stress
+   node furthest from any edge — the middle of the biggest safe region. */
+function pickMarkers(d,W,H){
+  // The solver picks these when it can: it is the only place that knows which
+  // nodes sit in the clamp collar. Those hold the largest numbers in the model
+  // and they are singular — they grow with every mesh refinement and describe
+  // nothing physical — so a picker that only sees the field would pin every
+  // "weakest point" badge to the bolt line and miss the real bore
+  // concentrations. The scan below is the fallback for an older payload.
+  if(Array.isArray(d.callouts)&&d.callouts.length)
+    return d.callouts.map(c=>{
+      const pct=Math.round(Math.min(c.pct,1)*100);
+      const b=c.band||(c.kind==='hot'?'high':'low');
+      return {kind:c.kind,band:b,x:c.x,y:c.y,pct:c.pct,
+              txt:(c.kind==='hot'?'⚠ ':'✓ ')+BAND_NAME[b]+' · '+pct+'%'};
+    });
+  const n=d.nodes,vl=d.von_mises_pct||d.von_mises_linear||d.von_mises_norm,
+        vn=d.von_mises_norm;
+  const gap=0.15*Math.max(W,H), out=[], used=[];
+  const far=p=>used.every(q=>Math.hypot(p[0]-q[0],p[1]-q[1])>gap);
+  const order=[];
+  for(let i=0;i<vl.length;i++) if(vl[i]>=0.60) order.push(i);
+  order.sort((a,b)=>vl[b]-vl[a]);
+  for(const i of order){
+    if(out.length>=3)break;
+    if(!far(n[i]))continue;
+    used.push(n[i]);
+    out.push({kind:'hot',band:vl[i]>=0.8?'critical':'high',pct:vl[i],
+              x:n[i][0],y:n[i][1],
+              txt:'⚠ WEAK · '+Math.round(Math.min(vl[i],1)*100)+'% peak'});
+  }
+  // clearance = how far you can walk from a node before leaving the part
+  const clear=(x,y)=>{
+    if(!RB.mask)return 0;
+    let best=1e9;
+    for(const[dx,dy]of[[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]]){
+      let s=0;
+      for(;s<160;s++){
+        const px=Math.round(x+dx*s*3),py=Math.round(y+dy*s*3);
+        if(px<0||py<0||px>=RB.W||py>=RB.H||!RB.mask[py*RB.W+px])break;
+      }
+      best=Math.min(best,s*3);
+    }
+    return best;
+  };
+  let bi=-1,bs=-1;
+  for(let i=0;i<vn.length;i++){
+    if(vn[i]>0.38)continue;
+    const c=clear(n[i][0],n[i][1]);
+    const s=c*(1-vn[i]);
+    if(s>bs){bs=s;bi=i}
+  }
+  if(bi>=0&&bs>0.05*Math.max(W,H))
+    out.push({kind:'safe',band:'low',pct:vl[bi],x:n[bi][0],y:n[bi][1],
+              txt:'✓ STRONG · '+Math.round(Math.min(vl[bi],1)*100)+'%'});
+  return out;
+}
+
+function roundRect(ctx,x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();
+}
+
+function badgeFont(ctx,s){
+  ctx.font=`700 ${Math.round(11.5*s)}px ui-monospace,SFMono-Regular,Consolas,monospace`;
+}
+function badgeSize(ctx,m,s){
+  badgeFont(ctx,s);
+  return {w:ctx.measureText(m.txt).width+18*s, h:Math.round(21*s)};
+}
+
+/* The marker itself. Every callout gets one, always: the user asked for ALL
+   the weak and strong points, and a point the solver found but the canvas
+   never drew is a point the machinist never sees. */
+function drawDot(ctx,m,s){
+  const c=bandOf(m);
+  ctx.save();
+  ctx.beginPath();ctx.arc(m.x,m.y,5.4*s,0,6.2832);
+  ctx.fillStyle='rgba(4,7,12,.5)';ctx.fill();
+  ctx.beginPath();ctx.arc(m.x,m.y,3*s,0,6.2832);
+  ctx.fillStyle=c.dot;ctx.fill();
+  ctx.lineWidth=Math.max(1,1.1*s);ctx.strokeStyle='rgba(4,7,12,.85)';ctx.stroke();
+  ctx.restore();
+}
+
+/* Twenty callouts is the point; twenty badges stacked on each other is not.
+   Each label is offered a ring of positions around its own point and takes the
+   first that clears every label already down. Severity is served first, so if
+   anything ends up as a bare dot it is the mildest point on the part -- and it
+   still answers the hover readout, which is where the exact number lives. */
+const _BSEV={critical:4,high:3,caution:2,low:1,safe:1};
+const _BCAND=[[0,-1],[0,1],[1,0],[-1,0],[1,-1],[-1,-1],[1,1],[-1,1],
+              [0,-2],[0,2],[2,0],[-2,0],[1.7,-1.7],[-1.7,-1.7],[1.7,1.7],[-1.7,1.7]];
+function layoutBadges(ctx,ms,W,H,s){
+  const rank=m=>(_BSEV[m.band]||2)*10+Math.min(m.pct||0,1);
+  const order=ms.slice().sort((a,b)=>rank(b)-rank(a));
+  const placed=[],out=[],gap=3*s;
+  const clashes=r=>placed.some(q=>
+    !(r.x+r.w+gap<q.x||q.x+q.w+gap<r.x||r.y+r.h+gap<q.y||q.y+q.h+gap<r.y));
+  for(const m of order){
+    const {w,h}=badgeSize(ctx,m,s);
+    let box=null;
+    for(const[ox,oy]of _BCAND){
+      const r={x:m.x+ox*(w/2+10*s)-w/2, y:m.y+oy*(h/2+12*s)-h/2, w, h};
+      if(r.x<4||r.y<4||r.x+w>W-4||r.y+h>H-4)continue;
+      if(clashes(r))continue;
+      box=r;break;
+    }
+    if(box)placed.push(box);
+    out.push({m,box});
+  }
+  return out;
+}
+
+function drawBadge(ctx,m,W,H,s,box){
+  const c=bandOf(m);
+  const sz=badgeSize(ctx,m,s);
+  let bx,by;
+  if(box){bx=box.x;by=box.y}
+  else{
+    bx=Math.max(6,Math.min(W-sz.w-6,m.x-sz.w/2)); by=m.y-sz.h-15*s;
+    if(by<6)by=Math.min(H-sz.h-6,m.y+15*s);
+  }
+  const cx=bx+sz.w/2, cy=by+sz.h/2;
+  ctx.save();
+  ctx.strokeStyle=c.line;
+  ctx.lineWidth=Math.max(1,1.2*s);
+  // Leader from the badge edge nearest the point, so the line never crosses
+  // its own label.
+  ctx.globalAlpha=.75;
+  ctx.beginPath();
+  ctx.moveTo(Math.max(bx,Math.min(bx+sz.w,m.x)),
+             m.y<cy?by:(m.y>by+sz.h?by+sz.h:cy));
+  ctx.lineTo(m.x,m.y);ctx.stroke();
+  ctx.globalAlpha=1;
+  ctx.shadowColor='rgba(0,0,0,.65)';ctx.shadowBlur=8*s;
+  ctx.fillStyle=c.fill;
+  roundRect(ctx,bx,by,sz.w,sz.h,6*s);ctx.fill();
+  ctx.shadowBlur=0;ctx.stroke();
+  badgeFont(ctx,s);
+  ctx.fillStyle=c.txt;
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText(m.txt,cx,cy+.5*s);
+  ctx.restore();
+  drawDot(ctx,m,s);
+}
+
+/* Every bore, banded by its own rim stress -- the thing the old HTML version
+   did that the three-badge redesign lost. A ring around each hole says at a
+   glance which bores are carrying the part and which are just fastener
+   clearance, and it is per-bore data from the solver rather than a reading off
+   the colour ramp, so a 6 px fillet concentration is not lost to the raster. */
+function drawHoleStress(ctx,d,s){
+  const hs=d.hole_stress; if(!Array.isArray(hs)||!hs.length)return;
+  ctx.save();
+  for(const h of hs){
+    const c=BAND_COL[h.band]||BAND_COL.caution;
+    const r=Math.max(4,h.r);
+    // Halo width tracks severity: a critical rim gets a fat soft glow, a safe
+    // one a hairline. Reading the part at a glance should not need the legend.
+    const sev=Math.min(1,Math.max(0,h.mean_pct!=null?h.mean_pct:h.pct||0));
+    ctx.globalAlpha=.16+.38*sev;
+    ctx.lineWidth=Math.max(3,(3.5+9*sev)*s);
+    ctx.strokeStyle=c.dot;
+    ctx.beginPath();ctx.arc(h.x,h.y,r+ctx.lineWidth*0.55,0,6.2832);ctx.stroke();
+    ctx.globalAlpha=.92;
+    ctx.lineWidth=Math.max(1,1.25*s);
+    ctx.setLineDash(h.singular?[4*s,3*s]:[]);
+    ctx.beginPath();ctx.arc(h.x,h.y,r+1.5*s,0,6.2832);ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  ctx.restore();
+}
+
+function render(d){
+  demoOff();
+  const cv=$('cv'),ctx=cv.getContext('2d');const[W,H]=d.image_size;
+  cv.width=W;cv.height=H;ctx.clearRect(0,0,W,H);
+  const s=Math.max(0.75,Math.min(W,H)/620);     // badge scale, so text is legible on any part
+  ctx.putImageData(rasterField(d,W,H),0,0);
+
+  // silhouette + bores
+  const n=d.nodes;
+  ctx.save();
+  ctx.lineJoin='round';ctx.lineCap='round';
+  ctx.shadowColor='rgba(255,214,130,.5)';ctx.shadowBlur=9*s;
+  ctx.strokeStyle='rgba(255,241,204,.8)';ctx.lineWidth=Math.max(1,1.5*s);
+  for(const loop of boundaryLoops(d)){
+    ctx.beginPath();ctx.moveTo(n[loop[0]][0],n[loop[0]][1]);
+    for(let i=1;i<loop.length;i++)ctx.lineTo(n[loop[i]][0],n[loop[i]][1]);
+    ctx.closePath();ctx.stroke();
+  }
+  ctx.restore();
+
+  // what the engine decided to cut, on top of the field that decided it
+  const cuts=d.pocket_outlines||[];
+  $('outlineRow').style.display=cuts.length?'flex':'none';
+  if(cuts.length&&$('showCuts').checked){
+    ctx.save();
+    ctx.lineWidth=Math.max(1.2,1.6*s);ctx.strokeStyle='rgba(8,12,20,.9)';
+    ctx.setLineDash([7*s,4*s]);
+    for(const poly of cuts){
+      ctx.beginPath();ctx.moveTo(poly[0][0],poly[0][1]);
+      for(let i=1;i<poly.length;i++)ctx.lineTo(poly[i][0],poly[i][1]);
+      ctx.closePath();ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  if($('showMarks').checked){
+    drawHoleStress(ctx,d,s);
+    const ms=pickMarkers(d,W,H);
+    // Dots first for the whole set, then labels over the top of them, so a
+    // badge is never hidden behind a neighbouring point's marker.
+    for(const m of ms) drawDot(ctx,m,s);
+    for(const p of layoutBadges(ctx,ms,W,H,s)) if(p.box) drawBadge(ctx,p.m,W,H,s,p.box);
+  }
+  drawMapKey(d);
+}
+
+function drawMapKey(d){
+  const el=$('mapKey');if(!el)return;
+  el.querySelector('.ttl').textContent=String(d.mode||'structural').toUpperCase()+' STRESS MAP';
+  const mpa=v=>v>=100?v.toFixed(0):v>=10?v.toFixed(1):v.toFixed(2);
+  const bits=[d.material||'', 'peak ≈ '+mpa((d.peak_vm||0)/1e6)+' MPa'];
+  if(d.safety_factor)bits.push('SF '+d.safety_factor.toFixed(1)+'×');
+  if(d.pocketing)bits.push(d.pocketing.n_pockets+' pockets · '+
+    Math.round(d.pocketing.removable_frac*100)+'% off');
+  $('mapKeyFoot').textContent=bits.join(' · ');
+  el.style.display=view==='stress'?'block':'none';
+}
+
+/* How the plate divides up, by area. Worth stating in words next to the
+   picture: "30% critical" is the number that tells you whether this part is
+   worth pocketing at all, and it is not something you can eyeball off a
+   gradient. */
+/* The heading both bottom panels share: what you are looking at, and the
+   coarse shape class the engine put this part in. The aspect ratio is spelled
+   out because it is the single number that decides whether the part is treated
+   as a beam (bending along one axis) or as a plate (load spreading in two),
+   and that choice changes every pocket downstream. */
+function shapeLine(d,lead){
+  const g=(d.pocketing||{}).geometry||{};
+  let L=g.length_mm,Wd=g.width_mm;
+  if(!(L>0&&Wd>0)){const s=d.image_size||[1,1];L=Math.max(s[0],s[1]);Wd=Math.min(s[0],s[1])}
+  const ar=Math.max(L,Wd)/Math.max(1e-6,Math.min(L,Wd));
+  const fam=ar>=3?'Beam/bar':(ar>=1.8?'Elongated plate':'Plate/block');
+  return '<b>'+lead+'</b> · '+fam+' (AR '+ar.toFixed(1)+':1)';
+}
+
+const CASE_TEXT={cantilever:'Cantilever — fixed one end, load at free end',
+  ss_center:'Simply supported — load at centre',
+  ss_dist:'Simply supported — distributed load',
+  fixed_fixed:'Fixed–fixed — both ends clamped'};
+
+/* Stress-view caption: the load case actually solved, then the features the
+   solver found driving the field. Drivers come from the server because they
+   are measured off the geometry (bore proximity, ligament width) rather than
+   inferred from the dropdowns. */
+function stressNoteHTML(d){
+  const drv=(d.drivers||[]).join(' · ');
+  return shapeLine(d,'Full structural')+
+    '<br><span style="color:#a3a3a3">'+
+    (CASE_TEXT[d.load_case]||d.load_case||'')+' · '+
+    (d.orientation||'horizontal')+' axis'+(drv?' · '+drv:'')+'</span>'+
+    zoneLine(d);
+}
+
+/* Pocket-view caption: same part, but the question is which rib archetype the
+   geometry earned and how much of the plate that frees up. */
+function pocketNoteHTML(d){
+  if(!(d.pocketing&&d.pocketing.pattern)) return '';
+  const g=d.pocketing.geometry||{};
+  const names={truss:'Truss',waffle:'Diamond waffle',radial:'Radial rib',xbrace:'X-brace'};
+  const mix=Object.entries(d.pocketing.region_patterns||{})
+    .filter(([k])=>k!=='none').map(([k,n])=>n+'× '+(names[k]||k)).join(', ');
+  // Caption what was DRAWN, not how the part was classified. The two disagree
+  // whenever a broad panel classifies as `waffle` and its one region comes
+  // back `radial` -- and the old code headlined `pattern` with `pattern`'s
+  // note, so the reader saw radial ribs above prose describing an even field
+  // of near-equilateral bays. Lead with the region, and say what the part
+  // classified as only when it differs, because that difference is
+  // information rather than a contradiction to hide.
+  const partPat = d.pocketing.pattern;
+  const regPat  = d.pocketing.region_pattern || partPat;
+  const headPat = names[regPat] || regPat;
+  const headNote = (regPat===partPat ? d.pocketing.note
+                                     : d.pocketing.region_note) || d.pocketing.note || '';
+  const classedAs = (regPat!==partPat && partPat)
+    ? '<span style="color:#a3a3a3"> (part classified as '+
+      esc(names[partPat]||partPat)+')</span>' : '';
+  return shapeLine(d,'Pocketing focus')+
+    '<br><b>'+esc(headPat)+'</b>'+classedAs+' — '+headNote+
+    '<br><span style="color:#a3a3a3">'+
+    g.length_mm+' × '+g.width_mm+' mm · slenderness '+g.slenderness+' · '+
+    g.n_bores+' structural bore(s) · regions: '+(mix||'single pocket')+'</span>'+
+    planLine(d)+hotSatLine(d);
+}
+
+/* The engine switched the rib doubling off because the field was hot nearly
+   everywhere. Say so on the plan, loudly enough to be read: the alternative is
+   a plan that quietly differs from what the settings imply, and the difference
+   gets blamed on the pocketer rather than on the input that caused it. */
+function hotSatLine(d){
+  const pk=d.pocketing||{};
+  if(!pk.hot_saturated) return '';
+  return '<br><span style="color:#fbbf24">⚠ Rib doubling disabled — '+
+    Math.round((pk.hot_frac||0)*100)+'% of the pocketable area reads as high '+
+    'stress. A field this uniformly hot is usually an input that was never set, '+
+    'not a part in trouble, so ribs were kept single width rather than letting '+
+    'one bad load case erase the plan.</span>';
+}
+
+/* What the plan actually does to the plate, in the three numbers a machinist
+   cares about. The stress-band split (zoneLine) belongs on the stress map: it
+   describes the FIELD, and on this view it read as a promise that 36% of the
+   part would be left solid — which is no longer what the engine does, and was
+   never what a pocketed 6061 plate looks like. */
+function planLine(d){
+  const pk=d.pocketing||{};
+  const off=pk.removable_frac, sol=pk.solid_frac;
+  if(!(off>=0)) return '';
+  const p=v=>Math.round(v*100)+'%';
+  const rib=Math.max(0,1-off-(sol||0));
+  return '<br><span style="color:#a3a3a3">'+
+    '<span style="color:#4ade80">●</span> '+p(off)+' machined away &nbsp; '+
+    '<span style="color:#d4d4d4">●</span> '+p(rib)+' ribs, rim &amp; bosses &nbsp; '+
+    '<span style="color:#f87171">●</span> '+p(sol||0)+' solid load path</span>';
+}
+
+function zoneLine(d){
+  const z=d.zone_frac; if(!z) return '';
+  const p=v=>Math.round(v*100)+'%';
+  return '<br><span style="color:#a3a3a3">'+
+    '<span style="color:#f87171">●</span> '+p(z.critical)+' critical &nbsp; '+
+    '<span style="color:#fbbf24">●</span> '+p(z.caution)+' caution &nbsp; '+
+    '<span style="color:#4ade80">●</span> '+p(z.safe)+' safe to remove</span>';
+}
+
+/* ================= pocketing plan view =================================
+   The same geometry as the stress map, answering a different question. The
+   map says how hard each bit of the plate is working; this says whether you
+   may put a cutter there — which is a yes/no per region, not a temperature.
+   Drawing it on a canvas rather than showing the server PNG directly is what
+   lets the labels stay sharp when the part is scaled to fit.               */
+function renderPocket(d){
+  const im=$('pocketImg'), cvp=$('cvp');
+  if(!im.naturalWidth) return;
+  const W=im.naturalWidth,H=im.naturalHeight;
+  cvp.width=W;cvp.height=H;
+  const g=cvp.getContext('2d');
+  g.clearRect(0,0,W,H);
+  g.drawImage(im,0,0,W,H);
+  // Text is sized in image pixels, so a 2000 px silhouette and a 500 px one
+  // both end up with labels that read the same on screen.
+  const s=Math.max(0.75,Math.min(2.2,Math.max(W,H)/900));
+  const pk=d.pocketing||{};
+
+  for(const h of pk.hole_notes||[]) drawHoleRing(g,h,s,d);
+  for(const p of labelledPockets(pk.pockets||[],s)) drawChip(g,p,s);
+  if(pk.keep_note) drawKeepCallout(g,pk.keep_note,W,H,s);
+  drawPocketKey(d);
+}
+
+/* Only label pockets with room for the text. A chip wider than its own pocket
+   points at the rib wall next to it, which is precisely the material you must
+   NOT cut — the most expensive possible misread. */
+function labelledPockets(pockets,s){
+  const out=[];
+  for(const p of pockets){
+    if(out.length>=12) break;
+    if(p.room < 13*s) continue;
+    out.push(p);
+  }
+  return out;
+}
+
+function drawChip(g,p,s){
+  const wide=p.room>34*s;
+  const t1=p.id+' · '+Math.round(p.stress*100)+'%', t2='safe to pocket';
+  g.save();
+  g.font=`700 ${Math.round(11*s)}px ui-monospace,SFMono-Regular,Consolas,monospace`;
+  const w1=g.measureText(t1).width;
+  g.font=`${Math.round(9*s)}px ui-monospace,SFMono-Regular,Consolas,monospace`;
+  const w2=wide?g.measureText(t2).width:0;
+  const pad=6*s, w=Math.max(w1,w2)+pad*2, h=(wide?27:17)*s;
+  const x=p.x-w/2, y=p.y-h/2;
+  g.fillStyle='rgba(8,22,14,.86)';
+  g.strokeStyle='rgba(74,222,128,.55)';g.lineWidth=Math.max(1,s);
+  roundRect(g,x,y,w,h,4*s);g.fill();g.stroke();
+  g.fillStyle='#86efac';g.textBaseline='top';
+  g.font=`700 ${Math.round(11*s)}px ui-monospace,SFMono-Regular,Consolas,monospace`;
+  g.fillText(t1,x+(w-w1)/2,y+4*s);
+  if(wide){
+    g.fillStyle='#4ade80';
+    g.font=`${Math.round(9*s)}px ui-monospace,SFMono-Regular,Consolas,monospace`;
+    g.fillText(t2,x+(w-w2)/2,y+16*s);
+  }
+  g.restore();
+}
+
+/* Two rings, two different rules — that's why they aren't the same colour.
+   Amber: a large bore is a hard boundary the pattern may not cross. Red: this
+   bore's rim is in the keep band, so the boss around it stays solid. */
+function drawHoleRing(g,h,s,d){
+  const t=d.pocket_thresholds||{keep:0.55};
+  const hot=h.rim>=t.keep;
+  g.save();
+  g.lineWidth=Math.max(1.5,2*s);
+  if(h.kind==='large'){
+    g.strokeStyle='rgba(251,191,36,.9)';
+    g.setLineDash([7*s,5*s]);
+    g.beginPath();g.arc(h.x,h.y,h.r+7*s,0,7);g.stroke();
+    g.setLineDash([]);
+  }
+  if(hot){
+    g.strokeStyle='rgba(248,80,70,.95)';
+    g.beginPath();g.arc(h.x,h.y,h.r+2.5*s,0,7);g.stroke();
+  }
+  g.restore();
+}
+
+function drawKeepCallout(g,k,W,H,s){
+  const txt=Math.round(k.stress*100)+'% — do not remove material';
+  g.save();
+  g.font=`700 ${Math.round(11*s)}px ui-monospace,SFMono-Regular,Consolas,monospace`;
+  const pad=8*s,w=g.measureText(txt).width+pad*2,h=20*s;
+  const x=Math.min(Math.max(4,k.x-w/2),W-w-4), y=Math.min(Math.max(4,k.y-h/2),H-h-4);
+  g.fillStyle='rgba(60,10,10,.9)';g.strokeStyle='rgba(248,113,113,.9)';
+  g.lineWidth=Math.max(1,s);
+  roundRect(g,x,y,w,h,4*s);g.fill();g.stroke();
+  g.fillStyle='#fecaca';g.textBaseline='middle';
+  g.fillText(txt,x+pad,y+h/2);
+  g.restore();
+}
+
+function drawPocketKey(d){
+  const el=$('pocketKey');if(!el)return;
+  const g=(d.pocketing&&d.pocketing.geometry)||{};
+  const notes=(d.pocketing&&d.pocketing.hole_notes)||[];
+  const mount=notes.filter(h=>h.kind==='mount').length;
+  const bits=[d.material||''];
+  if(notes.length)bits.push(notes.length+' holes ('+mount+' mount)');
+  if(d.pocketing)bits.push(d.pocketing.n_pockets+' pockets · '+
+    Math.round(d.pocketing.removable_frac*100)+'% removed');
+  if(g.length_mm)bits.push(g.length_mm+' × '+g.width_mm+' mm');
+  $('pocketKeyFoot').innerHTML=qesc(bits.filter(Boolean).join(' · '))+calTag(d);
+  el.style.display=view==='pocket'?'block':'none';
+}
+
+/* Where these constants came from, shown next to the plan they produced.
+   The engine has always sent this flag and the UI has always ignored it, which
+   made one specific failure completely silent: the calibration tool's "write
+   the file?" prompt defaults to No, so declining it by pressing Enter leaves
+   you with an unchanged plan, an unchanged footer, and no way to tell whether
+   the fit you just sat through for four minutes did anything at all. The
+   answer to "why does this look the same as before" should be legible from the
+   picture, not from going and looking for a JSON file.
+
+   The size range matters as much as the flag. Constants fitted to nine
+   250-400 mm gussets are not a general improvement -- they are a better guess
+   for parts that size and a blind extrapolation for a bellypan -- so the range
+   sits in the chip instead of in a warning printed once at fit time. */
+function calTag(d){
+  const p=d.pocketing;
+  if(!p) return '';
+  const c=p.calibration||{active:!!p.calibrated,n_parts:0,span_mm:null};
+  if(!c.active) return tag('shipped defaults','#a3a3a3',
+    'No calibration file — this plan uses the constants CADAI ships with. '+
+    'CALIBRATE_POCKETS.bat option 3 fits them to parts you have machined.');
+  const n=c.n_parts||0;
+  const sp=c.span_mm;
+  let txt='calibrated';
+  if(n) txt+=' · '+n+' part'+(n===1?'':'s');
+  if(sp&&sp.length===2) txt+=', '+Math.round(sp[0])+'–'+Math.round(sp[1])+' mm';
+  return tag(txt,'#22c55e',
+    'Running constants fitted to your own parts, from data/pocket_cal.json'+
+    (sp&&sp.length===2
+      ? '. Fitted over '+Math.round(sp[0])+'–'+Math.round(sp[1])+
+        ' mm — trust it least on parts far outside that range.'
+      : '.')+
+    (c.changed&&c.changed.length
+      ? ' Changed: '+c.changed.join(', ')+'.' : ''));
+}
+
+/* The colour bar means something different in each view, so it says something
+   different. Left as "Low → High von Mises" over the plan view it would invite
+   you to read the green pockets as "low stress colour", which is backwards:
+   they are green because they are CLEARED, not because they are cool. */
+function legendFor(v){
+  const lo=document.querySelector('.bar span'), bar=document.querySelector('.legend');
+  if(!lo||!bar)return;
+  const hi=bar.nextElementSibling;
+  if(v==='pocket'){
+    lo.textContent='Remove material freely';
+    if(hi)hi.textContent='Critical — keep material';
+  } else {
+    lo.textContent='Low';
+    if(hi)hi.textContent='High von Mises';
+  }
+  // The 3D map is painted from the same ramp, so it earns the same MPa ticks.
+  $('ticks').style.visibility=(v==='stress'||(v==='3d'&&solid3d))?'visible':'hidden';
+}
+
+/* ---- hover readout ---- */
+function bandAt(d,v){
+  const t=d.pocket_thresholds||{pocket:0.45,keep:0.55};
+  if(v<t.pocket) return {h:'STRONG',c:'#4ade80',
+    sub:'Low stress — this material is along for the ride.',
+    act:d.pocketing?'The engine pockets here.':'Safe to pocket.'};
+  if(v<t.keep) return {h:'CAUTION: Transition Zone',c:'#fbbf24',
+    sub:'Moderate stress — carries some load.',
+    act:'Machine with care; leave a rib if you cut into it.'};
+  if(v<0.80) return {h:'HIGH STRESS',c:'#fb923c',
+    sub:'This is what holds the part together.',
+    act:'Keep material here — reinforce rather than lighten.'};
+  return {h:'CRITICAL',c:'#f87171',
+    sub:'Top fifth of the field — this is where the part will start.',
+    act:'Do not thin this. If it needs to be lighter, move the load path.'};
+}
+
+/* The bore under the cursor, if there is one. Rim stress is per-bore data from
+   the solver, so it can say "this bearing bore is at 71%" even where the raster
+   underneath the cursor reads lower — the concentration lives in a few pixels
+   at the rim, and the ring drawn on the map is only as precise as the eye. */
+function holeAt(d,x,y){
+  const hs=d.hole_stress; if(!Array.isArray(hs))return null;
+  let best=null,bd=1e9;
+  for(const h of hs){
+    const dd=Math.hypot(x-h.x,y-h.y);
+    if(dd<=h.r*1.9+8&&dd<bd){bd=dd;best=h}
+  }
+  return best;
+}
+(function hookHover(){
+  const cv=$('cv'),tip=$('tip');
+  cv.addEventListener('mousemove',e=>{
+    if(view!=='stress'||!lastData||!RB.mask||panning){tip.style.display='none';return}
+    const r=cv.getBoundingClientRect();
+    const x=Math.round((e.clientX-r.left)*RB.W/r.width),
+          y=Math.round((e.clientY-r.top)*RB.H/r.height);
+    if(x<0||y<0||x>=RB.W||y>=RB.H||!RB.mask[y*RB.W+x]){tip.style.display='none';return}
+    const i=y*RB.W+x, v=RB.fn[i], pct=RB.fl[i], d=lastData;
+    const b=bandAt(d,v);
+    // σ here is a real number, not a ratio dressed up as one: the fraction of
+    // the hottest converged node times that node's stress.
+    const hot=(d.hot_ref_vm||d.scale_ref_vm||0)/1e6, sig=pct*hot;
+    const f=q=>q>=100?q.toFixed(0):q>=10?q.toFixed(1):q.toFixed(2);
+    const hl=holeAt(d,x,y);
+    const hlTxt=hl?('<div class="sub" style="margin-top:4px;color:'+
+      ((BAND_COL[hl.band]||BAND_COL.caution).dot)+'">bore ⌀'+
+      (2*hl.r/(d.px_per_mm||1)).toFixed(1)+' mm · rim '+
+      Math.round(Math.min(hl.pct,1)*100)+'% of peak'+
+      (hl.singular?' (clamp edge — singular, read the trend not the number)':
+        ' · '+(BAND_NAME[hl.band]||''))+'</div>'):'';
+    tip.innerHTML='<div class="h" style="color:'+b.c+'">'+b.h+'</div>'+
+      b.sub+' <b>'+Math.round(Math.min(pct,1)*100)+'% of peak.</b><br>'+b.act+
+      '<div class="sub" style="margin-top:4px">σ ≈ '+f(sig)+' MPa'+
+      (hot?' · hottest point '+f(hot)+' MPa':'')+'</div>'+hlTxt;
+    const wrap=cv.parentElement.getBoundingClientRect();
+    tip.style.display='block';
+    const tw=tip.offsetWidth,th=tip.offsetHeight;
+    let lx=e.clientX-wrap.left+16, ly=e.clientY-wrap.top-th-12;
+    if(lx+tw>wrap.width-8)lx=e.clientX-wrap.left-tw-16;
+    if(ly<8)ly=e.clientY-wrap.top+18;
+    tip.style.left=lx+'px';tip.style.top=ly+'px';
+  });
+  cv.addEventListener('mouseleave',()=>{tip.style.display='none'});
+})();
+
+// ---- chat ----
+/* How far a cited page's claims actually reach.
+   A design-challenge brief and a WPILib reference page look identical in a list
+   of blue links, and that is how "the base must be no higher than 3.5 ft" — an
+   acceptance criterion of one practice exercise — ended up read as a rule about
+   shooters. The answer now attributes narrow sources in its own text; this tag
+   is the same information where the reader is looking when they decide whether
+   to trust a number. Broad sources get no tag: marking everything marks nothing. */
+const KIND_TAG={
+  exercise:['practice brief','#f59e0b','limits stated here apply only inside that exercise'],
+  rules:['season rules','#f59e0b','binds one competition year'],
+  convention:['team convention','#f59e0b','one team’s own practice, not a general requirement'],
+  forum:['forum','#a3a3a3','one team’s experience, not consensus'],
+  blog:['blog','#a3a3a3','one author’s opinion']
+};
+const qesc=t=>String(t==null?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+function tag(text,colour,why){
+  return ' <span title="'+qesc(why)+'" style="color:'+colour+';border:1px solid '+colour+
+    '55;border-radius:3px;padding:0 3px;font-size:.52rem;vertical-align:1px">'+qesc(text)+'</span>';
+}
+function kindTag(s){
+  const k=KIND_TAG[s&&s.kind];
+  return k?tag(k[0],k[1],k[2]):'';
+}
+/* Where the text actually came from, which changes how much of it to believe.
+   All three of these are invisible in a list of blue links and all three change
+   the reading: a local document is one you chose and can edit, a full page was
+   read end to end rather than through a 700-character search snippet, and a
+   snippet is the introduction of an article rather than its answer. */
+function originTag(s){
+  if(!s) return '';
+  if(s.local) return tag('your library','#d4d4d4',
+    'from your local knowledge base — a document you ingested, not a live web result');
+  if(s.full_page) return tag('full page','#22c55e',
+    'the whole page was read, not just the search-result snippet');
+  return '';
+}
+/* The grounding verdict, stated as narrowly as what was actually done.
+   "ok" must not read as "this answer is correct" — it means every number in the
+   answer also appears in a source the answer points at. That is a real check and
+   a small one, and the wording has to carry both halves or it does more harm
+   than the check does good. */
+function groundBadge(g){
+  if(!g||g.verdict==='skipped') return '';
+  const M={
+    ok:['#22c55e','✓ numbers match their sources'],
+    partial:['#f59e0b','⚠ '+(g.flags||[]).length+' number'+((g.flags||[]).length===1?'':'s')+' not found in the sources cited'],
+    unsourced:['#a3a3a3','no sources — numbers unverified']
+  }[g.verdict];
+  if(!M) return '';
+  return '<div title="'+qesc(g.note||'')+'" style="margin-top:4px;font-size:.58rem;color:'+
+    M[0]+'">'+qesc(M[1])+'</div>';
+}
+/* The lightest possible markdown: **bold** and _italic_. The assistant's own
+   trailing notes are written that way, and without this the reader sees the
+   asterisks. Deliberately not a markdown parser — anything more would have to
+   handle links and code fences, and the answer body is already escaped HTML. */
+function lite(html){
+  return html.replace(/\*\*([^*<>]{1,120}?)\*\*/g,'<b>$1</b>')
+             // ">" is in the leading class because line breaks are already
+             // <br> by this point, and the notes this exists for all start a
+             // line. Without it the one case it was written for is the one
+             // case it misses.
+             .replace(/(^|[\s(>])_([^_<>]{1,400}?)_(?=[\s.,;:)!?<]|$)/g,'$1<i>$2</i>')
+             // "- foo" at the start of a line is a list item, not a minus.
+             .replace(/(^|<br>)- /g,'$1&nbsp;&nbsp;• ');
+}
+/* The corpus does not announce itself in the chat panel any more.
+   It used to print "your library: N documents, M passages" under the greeting,
+   which was a fact about the corpus rather than about anything the reader had
+   asked -- identical on every question, and taking up the one line of the panel
+   a reader actually looks at. What the library did for a PARTICULAR answer is
+   still reported, per answer, in the grey line under it ("3 from your library")
+   and by the purple tag on each local source, which is the point at which the
+   count changes something.
+
+   /api/kb is still served -- `python tools/kb_ingest.py stats` and the
+   ADD_TO_LIBRARY menu are where corpus size belongs. */
+
+/* Draw one answer.
+
+   Pulled out of ask() and made a pure function of the payload so that the
+   streaming path and the whole-answer path cannot render differently: a partly
+   arrived answer is just a payload whose `answer` is shorter and whose
+   `grounding` is not there yet. `live` is true while text is still arriving,
+   and only suppresses the collapse-if-long treatment — clamping a body that is
+   still growing puts a "Show full answer" button under an answer that is not
+   finished, and moves it every time a line lands. */
+function renderAnswer(t,d,live){
+  try{
+    // show whatever the server actually said — never a bare "(no answer)"
+    const body=d.answer||d.detail||d.error||'';
+    let html=lite(body.replace(/</g,'&lt;').replace(/\n/g,'<br>').replace(/\[(\d{1,2})\]/g,(m,i)=>{
+      const s=(d.sources||[])[+i-1];
+      if(!s) return '';
+      // A knowledge-base document ingested from a file has no URL, so there is
+      // nothing to link to. Still render the marker: dropping it would silently
+      // break the numbering the rest of the answer is written against.
+      return s.url?`<sup><a href="${s.url}" target="_blank">[${i}]</a></sup>`
+                  :`<sup style="color:#d4d4d4">[${i}]</sup>`;}));
+    const esc=qesc;
+    if(d.sources&&d.sources.length){
+      // show the page title, not just the hostname — a bare "frcdesign.org" tells
+      // you nothing about whether the assistant actually found the right page
+      html+='<div style="margin-top:6px;border-top:1px solid #262626;padding-top:5px">'+
+      d.sources.map((s,i)=>{
+        const host=(s.host||(s.url||'').replace(/^https?:\/\/(www\.)?/,'').split('/')[0]||'your library');
+        const star=s.preferred?'<span title="matched this question\u2019s topic" style="color:#22c55e">\u25cf</span> ':'';
+        // A local document is not a link and must not pretend to be one; an
+        // <a> with an empty href reloads the app and loses the conversation.
+        const inner=`${star}[${i+1}] ${esc(s.title||host)} <span style="color:#737373">— ${esc(host)}</span>${kindTag(s)}${originTag(s)}`;
+        const style=`color:${s.local?'#d4d4d4':'#e6e6e6'};font-size:.62rem;display:block;margin:1px 0`;
+        return s.url?`<a href="${esc(s.url)}" target="_blank" style="${style}">${inner}</a>`
+                    :`<span style="${style}">${inner}</span>`;
+      }).join('')+'</div>';}
+    html+=groundBadge(d.grounding);
+    // Where the retrieval effort actually went. "searched X" alone hid the
+    // two things most worth knowing when an answer looks thin: whether the
+    // local library contributed anything, and whether the web results were
+    // read in full or only as search-result snippets.
+    const kbn=((d.plan||{}).kb||{}).hits||0, fp=(d.plan||{}).full_pages||0;
+    const bits=[];
+    if(kbn) bits.push(kbn+' from your library');
+    if(fp) bits.push(fp+' page'+(fp===1?'':'s')+' read in full');
+    const extra=bits.length?' · '+esc(bits.join(', ')):'';
+    if(d.plan&&(d.plan.topics||[]).length){
+      html+='<div style="margin-top:4px;font-size:.58rem;color:#737373">searched <b>'+
+        esc(d.plan.topics.join(' + '))+'</b> · '+esc((d.plan.domains||[]).slice(0,5).join(', '))+
+        ((d.plan.domains||[]).length>5?' +'+((d.plan.domains||[]).length-5)+' more':'')+extra+'</div>';
+    } else if(d.plan&&d.plan.search&&d.plan.search!=='on'){
+      html+='<div style="margin-top:4px;font-size:.58rem;color:#737373">web search: '+esc(d.plan.search)+extra+'</div>';
+    }
+    // Where the wait went. A question that takes eight seconds is not one slow
+    // thing, it is four or five things in a row, and without this the only
+    // honest answer to "why is it slow" is a guess. Stages are listed biggest
+    // first, so the one worth complaining about is the one you read first.
+    let tline='';
+    const ms=(d.plan||{}).timing_ms;
+    if(ms&&ms.total){
+      const NAME={analyse:'understanding the question',search:'web search',
+                  deepen:'reading pages',answer:'writing the answer',
+                  kb:'your library',check:'checking the numbers'};
+      const secs=v=>(v>=1000?(v/1000).toFixed(1)+' s':v+' ms');
+      const parts=Object.keys(NAME).filter(k=>(ms[k]||0)>=100)
+        .sort((a,b)=>ms[b]-ms[a])
+        .map(k=>esc(NAME[k])+' '+secs(ms[k])
+             +(k==='search'&&ms.searches?' ('+ms.searches+' at once)':''));
+      tline='<div style="margin-top:3px;font-size:.58rem;color:#a3a3a3">took '
+        +secs(ms.total)+(parts.length?' · '+parts.join(' · '):'')+'</div>';
+    }
+    // Show how the question was read, so a misread is visible rather than
+    // silently producing an answer to a different question.
+    const an=(d.plan||{}).analysis;
+    if(an&&an.restated){
+      let a='<div style="margin-top:3px;font-size:.58rem;color:#737373">read as: <i>'+esc(an.restated)+'</i>';
+      if(an.scope) a+=' · '+(an.scope==='specific'
+        ? 'what one named document says'
+        : 'general practice, not one exercise’s rules');
+      if(an.entities&&an.entities.length) a+=' · key: '+esc(an.entities.slice(0,5).join(', '));
+      t.innerHTML=html+a+'</div>'+tline;
+    } else { t.innerHTML=html+tline; }
+    if(!live) clipIfLong(t);
+  }catch(e){t.textContent='Error: '+e.message}
+  scrollChat();
+}
+
+/* Ask, and show the answer as it is written rather than after it is finished.
+   The wait has not got much shorter than the model takes to write; what has
+   changed is that none of it is spent looking at nothing. The sources arrive
+   before the first word, so the panel has something true in it within about a
+   second, and the text lands as it is produced.
+
+   The whole-answer endpoint is still there and is still correct, so any failure
+   to stream — an old server without /api/chat/stream, a proxy that buffers,
+   a browser without a readable body — falls back to it and simply looks the way
+   it did before. */
+const STAGE={analyse:'reading your question…',search:'searching…',
+             answer:'writing the answer…'};
+
+async function ask(){
+  const q=$('q').value.trim(); if(!q)return; $('q').value='';
+  add('u',q); const t=add('a','…');
+  let d={answer:'',sources:[],plan:null,grounding:null};
+  let started=false;      // has a single character of the answer arrived?
+  // Re-render on an animation frame rather than on every delta. Groq sends a
+  // frame per token; repainting the source list and the plan line a few hundred
+  // times a second is work nobody can see.
+  let pending=false;
+  const paint=()=>{ if(pending) return; pending=true;
+    requestAnimationFrame(()=>{pending=false; renderAnswer(t,d,true);}); };
+  try{
+    const r=await fetch('/api/chat/stream',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})});
+    if(!r.ok||!r.body) throw new Error('no stream');
+    const reader=r.body.getReader(), dec=new TextDecoder();
+    let buf='';
+    for(;;){
+      const {value,done}=await reader.read();
+      if(done) break;
+      buf+=dec.decode(value,{stream:true});
+      // A read can end mid-line, so the last fragment is kept for the next one.
+      const lines=buf.split('\n'); buf=lines.pop();
+      for(const line of lines){
+        if(!line.trim()) continue;
+        let ev; try{ ev=JSON.parse(line); }catch(e){ continue; }
+        if(ev.type==='stage'){
+          if(!started) t.textContent=STAGE[ev.stage]||'…';
+        } else if(ev.type==='plan'){
+          d.plan=ev.plan; d.sources=ev.sources||[]; paint();
+        } else if(ev.type==='delta'){
+          started=true; d.answer+=ev.text; paint();
+        } else if(ev.type==='done'){
+          d=ev.result||d; started=true;
+        } else if(ev.type==='error'){
+          d.answer=(d.answer?d.answer+'\n\n':'')+'Assistant error: '+ev.message;
+          started=true;
+        }
+      }
+    }
+    // The final paint is not throttled and is not `live`: this is the one that
+    // adds the grounding badge, the timing line and the trailing notes, and
+    // clamps the answer if it turned out long.
+    renderAnswer(t,d,false);
+    scrollChat();
+  }catch(e){
+    // Only retry from scratch if nothing was written yet. Once words are on
+    // screen, asking again would charge for a second answer and replace the
+    // one the reader is already reading with a different one.
+    if(started){
+      d.answer+='\n\n_The connection dropped part way through: '+e.message+'_';
+      renderAnswer(t,d,false); scrollChat(); return;
+    }
+    try{
+      const r=await fetch('/api/chat',{method:'POST',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})});
+      const j=await r.json();
+      if(!j.answer&&!j.detail&&!j.error)
+        j.answer='Server returned HTTP '+r.status+' with no message.';
+      renderAnswer(t,j,false);
+    }catch(e2){ t.textContent='Error: '+e2.message; }
+    scrollChat();
+  }
+}
+function add(cls,txt){const m=document.createElement('div');m.className='m '+cls;m.textContent=txt;$('msgs').appendChild(m);scrollChat(true);return m}
+
+// ---- chat panel sizing ----
+// A long cited answer used to run off the bottom of a 330px column with no
+// way to see the rest. Three fixes: the panel is wider by default, it can be
+// dragged or toggled wider still, and any answer taller than the panel is
+// clamped with an explicit expander instead of just overflowing.
+function clipIfLong(el){
+  const raw=el.innerHTML;
+  const body=document.createElement('div'); body.className='body'; body.innerHTML=raw;
+  el.innerHTML=''; el.appendChild(body);
+  if(body.scrollHeight>420){
+    body.classList.add('clip');
+    const b=document.createElement('button'); b.className='more'; b.textContent='▾ Show full answer';
+    b.onclick=()=>{const open=body.classList.toggle('clip');
+      b.textContent=open?'▾ Show full answer':'▴ Collapse';};
+    el.appendChild(b);
+  }
+}
+function scrollChat(force){
+  const m=$('msgs');
+  const near=m.scrollHeight-m.scrollTop-m.clientHeight<150;
+  if(force||near){m.scrollTop=1e9;$('jumpBtn').style.display='none';}
+  else $('jumpBtn').style.display='block';
+}
+$('msgs').addEventListener('scroll',()=>{
+  const m=$('msgs');
+  if(m.scrollHeight-m.scrollTop-m.clientHeight<40)$('jumpBtn').style.display='none';
+});
+function setChatWidth(px){
+  const w=Math.max(300,Math.min(px,window.innerWidth-420));
+  $('chatPanel').style.width=w+'px';
+  try{localStorage.setItem('svChatW',w)}catch(e){}
+  $('wideBtn').textContent=w>=600?'⇔ Narrower':'⇔ Wider';
+}
+function toggleWide(){
+  const cur=$('chatPanel').getBoundingClientRect().width;
+  setChatWidth(cur>=600?420:Math.min(700,window.innerWidth-460));
+}
+(function(){
+  try{const s=parseInt(localStorage.getItem('svChatW')||'',10); if(s)setChatWidth(s);}catch(e){}
+  let drag=false;
+  $('chatGrip').addEventListener('mousedown',e=>{drag=true;e.preventDefault();document.body.style.userSelect='none'});
+  window.addEventListener('mousemove',e=>{if(drag)setChatWidth(window.innerWidth-e.clientX)});
+  window.addEventListener('mouseup',()=>{drag=false;document.body.style.userSelect=''});
+})();
+
+/* ==========================================================================
+   Example parts and the placeholder map
+   --------------------------------------------------------------------------
+   Two problems, one mechanism. An empty canvas on first load makes the tool
+   look broken rather than idle, and a stranger with no STEP file to hand has
+   no way to find out what it does. So: a small gallery of outlines, drawn
+   here rather than shipped as images, and a hand-drawn illustration of a
+   finished map on the canvas until a real solve replaces it.
+
+   The outlines are drawn to an offscreen canvas as a dark silhouette on white
+   -- exactly what app/geometry.py expects from a photographed part -- and
+   handed to setFile() as a PNG. Clicking an example therefore does not fake
+   anything: it uploads a part, and Run gives a real solve on real geometry.
+
+   The placeholder field IS drawn rather than computed, and says so in the
+   badge over it, because computing it would mean a solve on page load for
+   every visitor -- the one operation this app pays real money for.
+   ========================================================================== */
+
+const DEMO_W=760, DEMO_H=520;
+
+/* ---- outline builders --------------------------------------------------- */
+function rrect(x,y,w,h,r){
+  const p=[],seg=7;
+  const cor=[[x+w-r,y+h-r,0],[x+r,y+h-r,90],[x+r,y+r,180],[x+w-r,y+r,270]];
+  for(const [cx,cy,a0] of cor)
+    for(let i=0;i<=seg;i++){
+      const a=(a0+i*90/seg)*Math.PI/180;
+      p.push([cx+r*Math.cos(a),cy+r*Math.sin(a)]);
+    }
+  return p;
+}
+function ngon(cx,cy,R,n,rot){
+  const p=[];
+  for(let i=0;i<n;i++){const a=(rot||0)+i*2*Math.PI/n;p.push([cx+R*Math.cos(a),cy+R*Math.sin(a)])}
+  return p;
+}
+function slot(x1,y1,x2,y2,r){
+  // A slot is a rectangle with two half-round ends; built as one loop so it
+  // reads as a single hole to findContours rather than three overlapping ones.
+  const a=Math.atan2(y2-y1,x2-x1), p=[], seg=10;
+  for(let i=0;i<=seg;i++){const t=a-Math.PI/2+i*Math.PI/seg;p.push([x2+r*Math.cos(t),y2+r*Math.sin(t)])}
+  for(let i=0;i<=seg;i++){const t=a+Math.PI/2+i*Math.PI/seg;p.push([x1+r*Math.cos(t),y1+r*Math.sin(t)])}
+  return p;
+}
+const circ=(cx,cy,r)=>ngon(cx,cy,r,30,0);
+
+/* ---- the gallery -------------------------------------------------------- */
+const PARTS=[
+  { name:'Cantilever arm', file:'example-arm.png',
+    outline:rrect(70,205,640,120,58),
+    holes:[circ(140,240,20),circ(140,292,20),circ(640,265,48),circ(470,265,30)] },
+
+  { name:'Gusset', file:'example-gusset.png',
+    outline:[[90,110],[430,110],[560,180],[620,300],[620,410],[150,410],[90,350]],
+    holes:[circ(150,170,20),circ(230,170,20),circ(150,350,20),circ(560,350,26),circ(380,270,64)] },
+
+  { name:'L-bracket', file:'example-l-bracket.png',
+    outline:[[110,90],[330,90],[330,320],[650,320],[650,440],[110,440]],
+    holes:[circ(180,160,22),circ(265,160,22),circ(180,380,22),circ(430,380,28),
+           circ(540,380,28),circ(600,380,28)] },
+
+  { name:'Bearing plate', file:'example-bearing-plate.png',
+    outline:rrect(150,80,470,370,30),
+    holes:[circ(385,265,105),circ(210,140,22),circ(560,140,22),circ(210,390,22),circ(560,390,22)] },
+
+  { name:'Hex upright', file:'example-hex-upright.png',
+    outline:ngon(380,265,200,6,Math.PI/6),
+    holes:[circ(380,265,90)].concat([0,1,2,3,4,5].map(i=>{
+      const a=Math.PI/6+i*Math.PI/3; return circ(380+140*Math.cos(a),265+140*Math.sin(a),21)})) },
+
+  { name:'Rail bracket', file:'example-rail-bracket.png',
+    outline:rrect(60,190,650,150,20),
+    holes:[slot(230,265,470,265,42),circ(130,265,26),circ(640,265,26)] },
+];
+
+/* Paints one part as app/geometry.py wants to meet it: light background, dark
+   body, background-coloured holes. Everything else in this file is cosmetic;
+   this function is an input format. */
+function paintPart(c,spec,W,H,bg,fg){
+  const sx=W/DEMO_W, sy=H/DEMO_H;
+  c.fillStyle=bg;c.fillRect(0,0,W,H);
+  c.fillStyle=fg;
+  c.beginPath();
+  spec.outline.forEach((p,i)=>{const x=p[0]*sx,y=p[1]*sy;i?c.lineTo(x,y):c.moveTo(x,y)});
+  c.closePath();c.fill();
+  c.fillStyle=bg;
+  for(const h of spec.holes){
+    c.beginPath();
+    h.forEach((p,i)=>{const x=p[0]*sx,y=p[1]*sy;i?c.lineTo(x,y):c.moveTo(x,y)});
+    c.closePath();c.fill();
+  }
+}
+
+/* ---- the placeholder field ---------------------------------------------
+   Not FEM. A cantilever's bending stress is proportional to the moment, which
+   falls linearly from the fixed end, times the distance from the neutral
+   axis. Both are read off the silhouette itself -- the neutral axis is the
+   centroid of each column of material, the half-depth is that column's spread
+   -- so the picture follows whatever outline it is given instead of being a
+   fixed gradient. A boundary-distance term reddens free edges and rings the
+   holes, which is where a real solve puts its concentrations. It is a
+   plausible-looking drawing and nothing more, which is what the badge says. */
+const RAMP=[[0,0,200,70],[.25,120,210,0],[.5,234,179,8],[.75,249,115,22],[1,255,0,0]];
+function ramp(t){
+  t=Math.max(0,Math.min(1,t));
+  for(let i=1;i<RAMP.length;i++){
+    if(t<=RAMP[i][0]){
+      const a=RAMP[i-1],b=RAMP[i],f=(t-a[0])/(b[0]-a[0]||1);
+      return [a[1]+(b[1]-a[1])*f,a[2]+(b[2]-a[2])*f,a[3]+(b[3]-a[3])*f];
+    }
+  }
+  return [255,0,0];
+}
+function drawDemo(spec){
+  const cv=$('cv'),W=DEMO_W,H=DEMO_H;
+  cv.width=W;cv.height=H;
+  const ctx=cv.getContext('2d');
+  ctx.clearRect(0,0,W,H);
+
+  // silhouette -> inside mask
+  const off=document.createElement('canvas');off.width=W;off.height=H;
+  const oc=off.getContext('2d');
+  paintPart(oc,spec,W,H,'#ffffff','#000000');
+  const src=oc.getImageData(0,0,W,H).data;
+  const inside=new Uint8Array(W*H);
+  for(let i=0;i<W*H;i++) inside[i]=src[i*4]<128?1:0;
+
+  // two-pass chamfer distance to the nearest boundary, in pixels
+  const D=new Float32Array(W*H);
+  const BIG=1e6;
+  for(let i=0;i<W*H;i++) D[i]=inside[i]?BIG:0;
+  const at=(x,y)=>(x<0||y<0||x>=W||y>=H)?0:D[y*W+x];
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+    const i=y*W+x; if(!inside[i])continue;
+    D[i]=Math.min(D[i],at(x-1,y)+1,at(x,y-1)+1,at(x-1,y-1)+1.414,at(x+1,y-1)+1.414);
+  }
+  for(let y=H-1;y>=0;y--)for(let x=W-1;x>=0;x--){
+    const i=y*W+x; if(!inside[i])continue;
+    D[i]=Math.min(D[i],at(x+1,y)+1,at(x,y+1)+1,at(x+1,y+1)+1.414,at(x-1,y+1)+1.414);
+  }
+
+  // per-column neutral axis and half depth, plus the material's x extent
+  const yc=new Float32Array(W), hh=new Float32Array(W);
+  let x0=-1,x1=0;
+  for(let x=0;x<W;x++){
+    let n=0,s=0,lo=1e9,hi=-1e9;
+    for(let y=0;y<H;y++) if(inside[y*W+x]){n++;s+=y;if(y<lo)lo=y;if(y>hi)hi=y}
+    if(n){yc[x]=s/n;hh[x]=Math.max(6,(hi-lo)/2);if(x0<0)x0=x;x1=x}
+  }
+  const span=Math.max(1,x1-x0);
+
+  const img=ctx.createImageData(W,H);
+  const px=img.data;
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+    const i=y*W+x;
+    if(!inside[i]){px[i*4+3]=0;continue}
+    const mo=1-(x-x0)/span;                       // moment: 1 at the root, 0 at the tip
+    const fib=Math.min(1,Math.abs(y-yc[x])/hh[x]); // distance from the neutral axis
+    const conc=1+1.15*Math.exp(-D[i]/7);           // edges and bores run hot
+    let v=(0.12+0.88*mo*mo)*(0.18+0.82*fib)*conc;
+    v=Math.min(1,v*0.92);
+    const c=ramp(v);
+    px[i*4]=c[0];px[i*4+1]=c[1];px[i*4+2]=c[2];px[i*4+3]=255;
+  }
+  ctx.putImageData(img,0,0);
+
+  // same warm silhouette the real renderer draws, so the placeholder and the
+  // answer are visually the same kind of object
+  ctx.save();
+  ctx.lineJoin='round';ctx.lineCap='round';
+  ctx.shadowColor='rgba(255,214,130,.5)';ctx.shadowBlur=9;
+  ctx.strokeStyle='rgba(255,241,204,.8)';ctx.lineWidth=1.6;
+  for(const loop of [spec.outline].concat(spec.holes)){
+    ctx.beginPath();
+    loop.forEach((p,i)=>i?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]));
+    ctx.closePath();ctx.stroke();
+  }
+  ctx.restore();
+
+  cv.style.display=(view==='stress')?'block':'none';
+  $('demoBadge').style.display='block';
+  $('mapKey').style.display='none';
+}
+
+/* The placeholder is a guest on this canvas and leaves the moment the real
+   thing arrives. render() calls this; nothing else needs to know it existed. */
+function demoOff(){ $('demoBadge').style.display='none'; }
+
+/* ---- gallery wiring ----------------------------------------------------- */
+function buildThumbs(){
+  const box=$('thumbs'); if(!box)return;
+  box.innerHTML='';
+  PARTS.forEach((spec,i)=>{
+    const d=document.createElement('div');
+    d.className='thumb';d.title=spec.name+' — click to load as the part';
+    const c=document.createElement('canvas');
+    c.width=152;c.height=104;
+    paintPart(c.getContext('2d'),spec,152,104,'#161616','#c9c9c9');
+    const s=document.createElement('span');s.textContent=spec.name;
+    d.appendChild(c);d.appendChild(s);
+    d.onclick=()=>pickExample(i);
+    box.appendChild(d);
+  });
+}
+function pickExample(i){
+  const spec=PARTS[i];
+  [...$('thumbs').children].forEach((el,j)=>el.classList.toggle('on',j===i));
+  // Hand it to the real upload path. A 1520x1040 render gives the contour
+  // tracer enough pixels that a 20 px bolt hole survives simplification.
+  const off=document.createElement('canvas');off.width=1520;off.height=1040;
+  paintPart(off.getContext('2d'),spec,1520,1040,'#ffffff','#141414');
+  off.toBlob(b=>{
+    const f=new File([b],spec.file,{type:'image/png'});
+    setFile(f);
+    $('status').textContent='Example loaded — press Run FEM Analysis for a real solve. '+
+      'Thickness is yours to set; a drawing carries none.';
+  },'image/png');
+  if(!lastData){drawDemo(spec);showView('stress')}
+}
+buildThumbs();
+drawDemo(PARTS[0]);
+
+</script>
+</body>
+</html>
