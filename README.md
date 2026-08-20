@@ -1,4 +1,4 @@
-# StressViz — Python app (real FEM engine)
+# CADAI — Python app (real FEM engine)
 
 A finite-element stress-analysis and pocketing tool. The compute engine runs in
 Python (SciPy + scikit-fem + Triangle) so it can use a **quality unstructured
