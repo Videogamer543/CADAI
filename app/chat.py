@@ -398,7 +398,7 @@ def _groq(messages, model, temperature, max_tokens, system, stream):
     key = os.environ.get("GROQ_API_KEY")
     if not key:
         raise RuntimeError("GROQ_API_KEY not set")
-    model = model or os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+    model = model or os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
     full = [{"role": "system", "content": system or SYSTEM_PROMPT}] + messages
     r = requests.post(
         GROQ_ENDPOINT,
