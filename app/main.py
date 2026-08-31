@@ -231,7 +231,12 @@ async def analyze(
         # a little diameter -- but it is enormously better than no answer, and
         # the payload says which rung was used so a degraded run never passes
         # itself off as a clean one.
-        _LADDER = ((0.45, 400000), (0.8, 250000), (1.5, 120000))
+        # Caps lowered when app/step_worker.py gained curvature-based sizing.
+        # The fine size factors existed to stop small bores rounding away, and
+        # curvature now does that job directly and far more cheaply -- so the
+        # old 400k ceiling no longer buys silhouette quality, it just buys a
+        # rasterisation of a third of a million triangles.
+        _LADDER = ((0.45, 150000), (0.8, 100000), (1.5, 70000))
         from .step3d import tessellate as tess, silhouette_png
         from starlette.concurrency import run_in_threadpool
         t = None

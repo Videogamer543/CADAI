@@ -898,6 +898,10 @@ let panning=false;
 
 /* ---- interactive 3D solid renderer (painter's algorithm + lighting) ---- */
 const v3={rx:-0.5,ry:0.6,zoom:1,panX:0,panY:0,drag:false,mode:'rot',lx:0,ly:0};
+/* Facets drawn per frame while the mouse is down. Canvas has no z-buffer, so
+   every facet costs a sort key and a filled path on every frame — 40,000 of
+   them is a still picture, not an interaction. Full detail returns on mouseup. */
+const DRAG_FACET_BUDGET=9000;
 // Result of /api/analyze3d: the same surface the tessellator draws, but with a
 // von Mises value per vertex. When it's present it replaces the grey preview,
 // so the 3D tab shows the answer rather than just the shape.
@@ -909,8 +913,21 @@ function render3d(){
   const cv=$('cv3d'),ctx=cv.getContext('2d');
   const wrap=cv.parentElement; const W=cv.width=wrap.clientWidth,H=cv.height=wrap.clientHeight;
   ctx.clearRect(0,0,W,H);
-  const verts=solid3d?solid3d.verts:null;
-  const tris=src.tris, vn=solid3d?solid3d.vnorm:null;
+  // Both payloads are indexed now: the solved result always was, and the raw
+  // tessellation became so when curvature-based sizing made it ten times
+  // bigger and repeating every vertex six times stopped being affordable.
+  const verts=src.verts||null;
+  let tris=src.tris; const vn=solid3d?solid3d.vnorm:null;
+  // A curvature-sized tessellation is tens of thousands of facets, and every
+  // one of them is a sort key and a canvas fill on every frame. That is fine
+  // for a still picture and far too slow to drag. While the mouse is down the
+  // part is drawn from a subset -- a rotating solid at half detail is a shape
+  // you can aim, and the full mesh snaps back the moment you let go.
+  if(v3.drag && tris.length>DRAG_FACET_BUDGET){
+    const step=Math.ceil(tris.length/DRAG_FACET_BUDGET);
+    const out=[]; for(let i=0;i<tris.length;i+=step) out.push(tris[i]);
+    tris=out;
+  }
   const ctr=src.ctr, span=src.span;
   const crx=Math.cos(v3.rx),srx=Math.sin(v3.rx),cry=Math.cos(v3.ry),sry=Math.sin(v3.ry);
   const rot=p=>{let dx=(p[0]-ctr[0])/span,dy=(p[1]-ctr[1])/span,dz=(p[2]-ctr[2])/span;
@@ -942,7 +959,16 @@ function render3d(){
     else {r=150*sh+30|0; g=157*sh+30|0; b=174*sh+30|0;}
     const s0=f.p[0],s1=f.p[1],s2=f.p[2];ctx.beginPath();
     ctx.moveTo(s0[0]*sc+ox,-s0[1]*sc+oy);ctx.lineTo(s1[0]*sc+ox,-s1[1]*sc+oy);ctx.lineTo(s2[0]*sc+ox,-s2[1]*sc+oy);
-    ctx.closePath();ctx.fillStyle='rgb('+r+','+g+','+b+')';ctx.fill();}
+    ctx.closePath();
+    const col='rgb('+r+','+g+','+b+')';
+    ctx.fillStyle=col;ctx.fill();
+    // Stroke each facet in its own fill colour. Canvas antialiases the edge of
+    // a filled path, so two triangles sharing an edge each cover about half of
+    // that pixel and the background shows through the middle -- at 4,000 facets
+    // that is invisible, at 60,000 it reads as a wireframe drawn over the part.
+    // Skipped while dragging, where the seams are moving too fast to see and
+    // the second path per facet is the difference between smooth and not.
+    if(!v3.drag){ctx.strokeStyle=col;ctx.lineWidth=0.6;ctx.stroke();}}
 
   _proj3d=[];
   if(solid3d&&solid3d.callouts){
@@ -973,7 +999,10 @@ function render3d(){
 (function(){const cv=$('cv3d');
   cv.addEventListener('mousedown',e=>{v3.drag=true;v3.mode=(e.button===2||e.shiftKey)?'pan':'rot';v3.lx=e.clientX;v3.ly=e.clientY;cv.style.cursor=v3.mode==='pan'?'move':'grabbing';});
   cv.addEventListener('contextmenu',e=>e.preventDefault());
-  window.addEventListener('mouseup',()=>{v3.drag=false;cv.style.cursor='grab';});
+  // Repaint on release: the drag was drawn at reduced detail, so without this
+  // the part would sit there at half resolution until something else moved.
+  window.addEventListener('mouseup',()=>{const was=v3.drag;v3.drag=false;
+    cv.style.cursor='grab'; if(was&&view==='3d')render3d();});
   window.addEventListener('mousemove',e=>{if(!v3.drag||view!=='3d')return;const dx=e.clientX-v3.lx,dy=e.clientY-v3.ly;
     if(v3.mode==='pan'){v3.panX+=dx;v3.panY+=dy;}else{v3.ry+=dx*0.01;v3.rx+=dy*0.01;}v3.lx=e.clientX;v3.ly=e.clientY;render3d();});
   cv.addEventListener('wheel',e=>{if(view!=='3d')return;e.preventDefault();v3.zoom=Math.max(0.3,Math.min(4,v3.zoom*(e.deltaY<0?1.1:0.9)));render3d();},{passive:false});

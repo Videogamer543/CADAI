@@ -99,6 +99,33 @@ def min_width_axis(verts, iters=60):
     return best, bw
 
 
+def faces(tess):
+    """The tessellation as an (M, 3, 3) array of triangle corner coordinates.
+
+    app/step_worker.py ships INDEXED geometry -- a shared vertex table plus
+    integer triangles -- because repeating every vertex six times turned a
+    finer mesh into a double-digit-megabyte download. Everything in this module
+    was written against the expanded form, and expanding is one fancy-index, so
+    the conversion lives here rather than in five places.
+
+    The old un-indexed payload is still accepted. That matters for more than
+    tidiness: a tessellation can arrive from a cached result or an older worker,
+    and a shape check is cheaper than a class of bug where the silhouette is
+    silently computed from integers.
+    """
+    import numpy as np
+    t = np.asarray(tess.get("tris"), dtype=np.float64)
+    if t.size == 0:
+        return np.zeros((0, 3, 3), dtype=np.float64)
+    if t.ndim == 3 and t.shape[1:] == (3, 3):
+        return t                                   # already expanded
+    v = tess.get("verts")
+    if v is None:
+        raise ValueError("tessellation has neither expanded tris nor verts")
+    v = np.asarray(v, dtype=np.float64)
+    return v[np.asarray(tess["tris"], dtype=np.int64)]
+
+
 def plate_frame(tess):
     """(centroid, u, v, normal, thickness_mm) for a tessellated plate.
 
@@ -126,7 +153,7 @@ def plate_frame(tess):
     be as accurate as it can be.
     """
     import numpy as np
-    tris = np.asarray(tess["tris"], dtype=np.float64)
+    tris = faces(tess)
     if tris.size == 0:
         raise ValueError("empty tessellation")
     verts = tris.reshape(-1, 3)
@@ -176,7 +203,7 @@ def measure_thickness(tess, plate_ratio=0.18):
     """
     import numpy as np
     try:
-        verts = np.asarray(tess["tris"], dtype=np.float64).reshape(-1, 3)
+        verts = faces(tess).reshape(-1, 3)
         thin, diameter = plate_aspect(verts)
     except Exception:
         return None
@@ -209,7 +236,7 @@ def silhouette_png(tess, out_px=1500):
     from PIL import Image
     import io
 
-    tris = np.asarray(tess["tris"], dtype=np.float64)       # (M, 3, 3)
+    tris = faces(tess)                                      # (M, 3, 3)
     if tris.size == 0:
         raise ValueError("empty tessellation")
     verts = tris.reshape(-1, 3)
