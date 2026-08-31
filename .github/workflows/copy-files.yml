@@ -35,4 +35,4 @@ jobs:
             exit 0
           fi
           git commit -m "Automated full repository sync from CADAI"
-          git push origin main
+          git push origin main 
