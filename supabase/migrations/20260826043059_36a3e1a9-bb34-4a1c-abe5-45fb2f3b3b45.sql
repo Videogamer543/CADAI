@@ -1,0 +1,1 @@
+CREATE OR REPLACE FUNCTION public.user_count() RETURNS integer LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$ SELECT count(*)::integer FROM public.profiles; $$; REVOKE ALL ON FUNCTION public.user_count() FROM PUBLIC, anon, authenticated; GRANT EXECUTE ON FUNCTION public.user_count() TO anon, authenticated;
