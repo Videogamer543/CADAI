@@ -14,12 +14,11 @@ jobs:
         env:
           API_TOKEN_GITHUB: ${{ secrets.COPY_TOKEN }}
         run: |
-          # 1. Setup git credentials (fixed email format)
+          # 1. Setup git credentials
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
           
-          # 2. Clone using the correct target repository path
-          # REPLACE 'your-username/your-target-repo' with your actual target repo details
+          # 2. Clone the target repository using your exact path
           git clone "https://x-access-token:$API_TOKEN_GITHUB@://github.com" /tmp/target-repo
           
           # 3. Clean out target folder (excluding its hidden .git folder)
@@ -37,3 +36,4 @@ jobs:
           fi
           git commit -m "Automated full repository sync from CADAI"
           git push origin main
+
