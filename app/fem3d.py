@@ -479,7 +479,20 @@ def solve_solid(nodes_mm, tets, *, E=69e9, nu=0.33, load_case="cantilever",
         "bbox": {"min": mn.tolist(), "max": mx.tolist(),
                  "spans": (mx - mn).tolist()},
         "axes": {"span": span_ax.tolist(), "load": load_ax.tolist(),
-                 "extents_mm": (ext * 1e3).tolist()},
+                 "extents_mm": (ext * 1e3).tolist(),
+                 # Whether "the long axis" is a real feature of the part or an
+                 # artefact of the mesh. On a round part the two large extents
+                 # are equal to within meshing noise, so the PCA that picks the
+                 # span axis is choosing between directions that differ by a
+                 # fraction of a percent -- and it lands differently on every
+                 # remesh. Measured on a 36-tooth pulley: the span axis flipped
+                 # between -X and -Y across three mesh densities and the peak
+                 # stress moved 8.5 / 22.8 / 1.6 MPa with it. That is not
+                 # convergence, it is a coin toss, and a stress tool that hides
+                 # it is worse than one that admits it.
+                 "span_ambiguous": bool(ext[1] > 0.85 * ext[0]),
+                 "span_margin": (float(ext[0] / ext[1])
+                                 if ext[1] > 0 else 0.0)},
         "load_dir_name": ("edgewise (in the wide direction)"
                           if orientation == "horizontal"
                           else "flatwise (across the thin direction)"),

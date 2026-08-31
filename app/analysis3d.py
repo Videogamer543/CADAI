@@ -33,6 +33,37 @@ from .analysis import MODE_KT
 # of minutes.
 TARGET_TETS = 16000
 
+# What a machine WITHOUT PARDISO can actually carry. Measured on this solver,
+# factorising with SuperLU, on a 36-tooth pulley:
+#
+#     tets    P2 dofs   solve    peak RSS
+#     8,607    45,942    25 s     1,091 MiB
+#     9,070    47,859    31 s     1,209 MiB
+#    13,815    71,190    66 s     1,879 MiB
+#
+# So roughly 26 KiB of resident memory per quadratic degree of freedom, growing
+# faster than linearly. On a 2 GiB container carrying the app as well, 1.9 GiB
+# for the factorisation alone is not a slow request -- it is a SIGKILL partway
+# through, which FastAPI never sees, so nothing is logged and Cloud Run returns
+# 503 with an empty body. The old value here was 9,000 tets, which lands in
+# exactly that hole, and no amount of raising the container's memory fixes it
+# because the mesher was overshooting the target eightfold on top (see
+# app/vol_worker.py).
+#
+# 3,500 tets keeps the factorisation near 1.1 GiB and the solve near 25 s.
+TARGET_TETS_SLOW = int(os.environ.get("CADAI_3D_TARGET_TETS", "3500"))
+
+# Hard ceiling on quadratic degrees of freedom. Past this the solve is dropped
+# to linear tetrahedra, which is a real loss of accuracy -- P1 tets are stiff
+# in bending -- but it is a stated loss rather than a dead container.
+MAX_P2_DOFS = int(os.environ.get("CADAI_3D_MAX_DOFS", "52000"))
+
+# Measured ratio of P2 degrees of freedom to mesh nodes on tetrahedra: 19.1,
+# 19.3 and 19.8 across the three meshes above. 20 is the number to plan with,
+# and it is worth having because it can be computed BEFORE building the basis,
+# which is the last cheap moment to change your mind about element order.
+P2_DOFS_PER_NODE = 20.0
+
 
 def _mesh_step(data: bytes, target_tets: int = TARGET_TETS):
     """STEP bytes → (nodes_mm, tets). Runs gmsh out of process.
@@ -166,7 +197,12 @@ def run(data: bytes, *, filename="part", material="Aluminum 6061-T6",
     # wait. 9k tets still resolves the bores and the neutral plane; it just
     # reports peak stress a couple of percent differently.
     if _mkl_spsolve()[0] is None:
-        target_tets = min(target_tets, 9000)
+        target_tets = min(target_tets, TARGET_TETS_SLOW)
+        extra["solver_note"] = (
+            "No PARDISO on this machine, so the mesh is held to about "
+            f"{target_tets:,} elements — SuperLU's memory grows faster than "
+            "the element count, and a bigger mesh is not a slow answer, it is "
+            "no answer at all.")
 
     if name.endswith(".step") or name.endswith(".stp"):
         nodes_mm, tets = _mesh_step(data, target_tets)
@@ -195,9 +231,28 @@ def run(data: bytes, *, filename="part", material="Aluminum 6061-T6",
         extra["image_size"] = list(size)
         extra["holes"] = nholes
 
+    # Last gate before the expensive part. The mesher aims at a budget but the
+    # geometry gets a vote, so what actually came back is what has to be
+    # judged -- and it has to be judged HERE, because the failure downstream is
+    # the process being killed mid-factorisation, which no try/except can
+    # catch and nothing writes to the log.
+    n_nodes = int(np.asarray(nodes_mm).shape[0])
+    est_dofs = int(P2_DOFS_PER_NODE * n_nodes)
+    quadratic = est_dofs <= MAX_P2_DOFS
+    extra["mesh_tets"] = int(np.asarray(tets).shape[0])
+    extra["est_p2_dofs"] = est_dofs
+    if not quadratic:
+        extra["element_note"] = (
+            f"This mesh came back at {n_nodes:,} nodes, about {est_dofs:,} "
+            f"quadratic unknowns, past the {MAX_P2_DOFS:,} this server can "
+            "factorise. Solved with linear tetrahedra instead. Linear tets are "
+            "stiff in bending, so treat the peak stress as an underestimate "
+            "and the deflection as optimistic — the shape of the field is "
+            "still right, the magnitude is the part to distrust.")
+
     res = solve_solid(nodes_mm, tets, E=mat["E"], nu=mat["nu"],
                       load_case=load_case, orientation=orientation,
-                      load=float(load))
+                      load=float(load), quadratic=quadratic)
 
     # Same stress-concentration multiplier the flat path applies, so a part
     # analysed both ways reports one safety factor, not two.

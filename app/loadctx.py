@@ -234,8 +234,12 @@ def parse_llm(text, model=None):
     try:
         raw = chatmod.chat(
             [{"role": "user", "content": (text or "")[:1500]}],
+            # Retired by Groq alongside llama-3.3-70b-versatile. Like the
+            # planner in chat.py this call is inside a try/except that returns
+            # an empty parse, so a 404 here read as "the typed loading
+            # description said nothing useful" rather than as an outage.
             model=model or os.environ.get("GROQ_PLANNER_MODEL",
-                                          "llama-3.1-8b-instant"),
+                                          "openai/gpt-oss-20b"),
             temperature=0.0, max_tokens=400, system=_LLM_PROMPT)
         obj = chatmod._json_block(raw)
     except Exception:

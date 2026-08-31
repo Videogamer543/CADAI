@@ -3,24 +3,49 @@ High-level analysis orchestration: geometry → mesh → FEM → (modes, safety
 factor) → optional pocketing. One call the API can use.
 """
 from __future__ import annotations
+import os
 import numpy as np
 from .geometry import extract_polygons
-from .mesh import build_mesh, refine_by_field
+from .mesh import build_mesh, refine_by_field, density_preset
 from .fem import solve_plane_stress
 from . import materials, raster, pocketing
 
 # analysis-mode stress-concentration multipliers (match the browser app)
 MODE_KT = {"full": 1.0, "structural": 1.0, "fatigue": 1.35, "manufacturing": 1.15}
 
+# Hard ceiling on the refined element count, whatever the density preset asks
+# for. Measured on this solver: peak resident memory runs about 5.8 KiB per
+# degree of freedom, and P2 elements give roughly 4 DOF per triangle, so 45,000
+# elements is about 1.0 GiB on top of whatever the process is already holding.
+# That is the number that fits a 2 GiB container with the raster and pocketing
+# arrays alongside it. Raise it with CADAI_MAX_ELEMS on a bigger instance.
+#
+# This exists because the preset table is a promise about triangles and the
+# container has a budget in bytes; without the ceiling, adding a finer preset
+# is adding a way for the server to be killed mid-request, which is exactly the
+# failure that shows up as a 503 with an empty body and no traceback.
+MAX_ELEMS = max(4000, int(os.environ.get("CADAI_MAX_ELEMS", "45000")))
+
 
 def run(data: bytes, *, material="Aluminum 6061-T6", mode="structural",
         load_case="cantilever", orientation="horizontal", load=500.0,
         do_pocketing=False, px_per_mm=None, rib_mm=3.0, density="normal",
-        max_area=None, thickness_mm=6.35, adapt=True):
+        max_area=None, thickness_mm=6.35, adapt=True,
+        mesh_density="standard"):
+    """`density` is the POCKETING density (how much material comes off).
+    `mesh_density` is how finely the part is cut into triangles for the solve
+    -- "draft", "standard", "fine" or "ultra". They are unrelated knobs that
+    unfortunately both wanted the word "density", so both keep their own name.
+    """
     exterior, holes, size = extract_polygons(data)
     W, H = size
     mat = materials.get(material)
+    tgt_tris, cap_tris = density_preset(mesh_density)
+    cap_asked = cap_tris
+    cap_tris = min(cap_tris, MAX_ELEMS)
+    tgt_tris = min(tgt_tris, cap_tris)
     pts, tris, pslg, min_angle = build_mesh(exterior, holes, max_area=max_area,
+                                            target_tris=tgt_tris,
                                             return_pslg=True)
 
     # px/mm — STEP supplies the true scale; for images assume long side ~150 mm
@@ -43,7 +68,8 @@ def run(data: bytes, *, material="Aluminum 6061-T6", mode="structural",
         try:
             pts2, tris2 = refine_by_field(pts, tris, pslg,
                                           res["von_mises_norm"],
-                                          min_angle=min_angle)
+                                          min_angle=min_angle,
+                                          max_tris=cap_tris)
             if tris2.shape[0] > tris.shape[0]:
                 res2 = solve_plane_stress(pts2, tris2, **kw)
                 res2["adaptive_pass"] = True
@@ -91,6 +117,13 @@ def run(data: bytes, *, material="Aluminum 6061-T6", mode="structural",
         res["drivers"] = []
         res["drivers_error"] = str(ex)
 
+    # How fine the mesh ended up, and whether that is fine enough to believe.
+    # Reported as a number rather than as reassurance: "finer" is not free, and
+    # a reader who can see the element count and how many elements sit across
+    # the part's thinnest section can judge the picture for themselves.
+    res["mesh"] = _mesh_report(res, mesh_density, tgt_tris, cap_tris,
+                               cap_asked)
+
     if do_pocketing:
         part_mask, hole_mask = raster.masks_from_polygons(exterior, holes, W, H)
         # Same array the stress map paints. The picture IS the input to the
@@ -117,6 +150,82 @@ def run(data: bytes, *, material="Aluminum 6061-T6", mode="structural",
         res["pocket_outlines"] = _outlines(core)
         res["pocket_thresholds"] = pocketing.thresholds(density)
     return res
+
+
+# Elements across the thinnest section, below which a plane-stress answer is
+# not worth quoting. Two elements across a web cannot represent bending in it
+# at all; three is the usual rule of thumb for "the number is in the right
+# area"; six or more and refining further stops changing the answer much.
+MESH_BAD, MESH_OK = 3.0, 6.0
+
+
+def _mesh_report(res, preset, target_tris, cap_tris, cap_asked=None):
+    """Element count, typical element size, and an honest verdict on both.
+
+    The useful measure is not how many triangles there are -- 30,000 on a
+    750 mm rail is coarser than 5,000 on a 60 mm bracket -- but how many of
+    them fit across the narrowest piece of material the part has. That is the
+    dimension that has to bend, and if only two elements span it the solve is
+    reporting the mesh rather than the part.
+    """
+    tris = np.asarray(res.get("tris") or [])
+    pts = np.asarray(res.get("nodes") or [], dtype=float)
+    out = {"preset": preset, "elements": int(tris.shape[0]),
+           "nodes": int(res.get("n_nodes") or pts.shape[0]),
+           "dofs": int(res.get("n_dofs") or 0),
+           "target_tris": int(target_tris), "cap_tris": int(cap_tris),
+           "adaptive_pass": bool(res.get("adaptive_pass")),
+           "elements_before_refine": int(res.get("mesh_pass1_elems") or 0)}
+    # If the server's memory budget clipped the preset, say so on the result
+    # rather than quietly handing back a coarser mesh than was asked for.
+    if cap_asked and cap_asked > cap_tris:
+        out["capped"] = True
+        out["cap_asked"] = int(cap_asked)
+        out["cap_note"] = ("This server caps the mesh at %s elements to stay "
+                           "inside its memory budget, so the '%s' setting was "
+                           "held there." % (f"{cap_tris:,}", preset))
+    if tris.shape[0] == 0 or pts.shape[0] == 0:
+        out["verdict"] = "unknown"
+        out["note"] = ""
+        return out
+
+    a, b, c = pts[tris[:, 0]], pts[tris[:, 1]], pts[tris[:, 2]]
+    area = 0.5 * np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) -
+                        (c[:, 0] - a[:, 0]) * (b[:, 1] - a[:, 1]))
+    mean_a = float(area.mean()) if area.size else 0.0
+    # side of the equilateral triangle with that area -- a fair stand-in for
+    # "how big is a typical element", since the mesher targets 30-degree quality
+    edge_px = float(np.sqrt(max(mean_a, 0.0) * 4.0 / np.sqrt(3.0)))
+    ppm = float(res.get("px_per_mm") or 0.0)
+    out["elem_size_px"] = edge_px
+    if ppm > 0:
+        out["elem_size_mm"] = edge_px / ppm
+
+    lig = float(res.get("min_ligament_px") or 0.0)
+    if lig > 0 and edge_px > 0:
+        across = lig / edge_px
+        out["elements_across_thinnest"] = across
+        if across < MESH_BAD:
+            out["verdict"] = "coarse"
+            out["note"] = ("Only about %.1f elements fit across the thinnest "
+                           "section of this part. That is too few to trust the "
+                           "stress there — re-run at a finer mesh before "
+                           "quoting the number." % across)
+        elif across < MESH_OK:
+            out["verdict"] = "fair"
+            out["note"] = ("About %.1f elements across the thinnest section. "
+                           "Good enough to see where the load goes; a finer "
+                           "mesh would still move the peak a little."
+                           % across)
+        else:
+            out["verdict"] = "good"
+            out["note"] = ("About %.0f elements across the thinnest section — "
+                           "fine enough that refining further changes the "
+                           "answer very little." % across)
+    else:
+        out["verdict"] = "unknown"
+        out["note"] = ""
+    return out
 
 
 def _drivers(res, exterior, holes, W, H):

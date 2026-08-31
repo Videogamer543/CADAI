@@ -307,6 +307,151 @@ def _callouts(points, tris, vm_pct, vm_norm, keep, hot_cut=0.32,
     return out
 
 
+def _facet_pairs(m, facets, N, limit=800):
+    """A facet set as (n, 2) mesh-vertex index pairs, boundary facets only.
+
+    The drawing code wants line segments, not a cloud of nodes: a support is a
+    stretch of edge that is held, and scattering dots along it reads as noise.
+    Intersecting with the boundary is belt-and-braces -- these facet sets are
+    already boundary sets by construction -- but it costs nothing and it means
+    an interior facet can never end up drawn as a clamp.
+    """
+    fac = np.asarray(facets, dtype=np.int64).ravel()
+    if fac.size == 0:
+        return np.zeros((0, 2), int)
+    try:
+        bnd = np.asarray(m.boundary_facets(), dtype=np.int64).ravel()
+        if bnd.size:
+            fac = np.intersect1d(fac, bnd)
+    except Exception:
+        pass
+    if fac.size == 0:
+        return np.zeros((0, 2), int)
+    try:
+        seg = np.asarray(m.facets)[:, fac].T
+    except Exception:
+        return np.zeros((0, 2), int)
+    seg = np.asarray(seg, dtype=np.int64)
+    if seg.ndim != 2 or seg.shape[1] != 2:
+        return np.zeros((0, 2), int)
+    ok = (seg >= 0).all(axis=1) & (seg < N).all(axis=1)
+    seg = seg[ok]
+    if seg.shape[0] > limit:
+        seg = seg[np.unique(np.linspace(0, seg.shape[0] - 1,
+                                        limit).astype(int))]
+    return seg
+
+
+def _spread(xy, n):
+    """`n` points spread along a set of points by position, not by index.
+
+    Facets come out of the mesh in whatever order the triangulator built them,
+    so taking every k-th one clumps the glyphs at one end. Sorting by position
+    along the set's own long axis first makes them land evenly on the edge.
+    """
+    xy = np.asarray(xy, float)
+    if xy.shape[0] <= n:
+        return xy
+    long_ax = 0 if np.ptp(xy[:, 0]) >= np.ptp(xy[:, 1]) else 1
+    o = np.argsort(xy[:, long_ax])
+    pick = np.unique(np.linspace(0, o.size - 1, n).astype(int))
+    return xy[o[pick]]
+
+
+def _bc_payload(m, points, tris, N, ax, trans_dof, load_case, load,
+                fixed_facets, fixed_nodes, load_facets, load_nodes,
+                applied, span_px, size_px, min_px):
+    """Where the part is held and where the force goes, in node coordinates.
+
+    Everything here is read back out of the boundary conditions the solve
+    actually used -- the same facet set that was condensed out of the stiffness
+    matrix, and the same one the traction was integrated over. It is not a
+    second drawing of the load case from the dropdown, because that is the
+    version that can quietly disagree with the maths. If the solver fell back
+    to lumped nodal forces, that fallback is what gets drawn, and
+    `load_applied_as` says so on the picture.
+
+    Coordinates are the raw pixel-space `points` array -- the same frame the
+    stress map paints in -- so the front end can draw straight onto the canvas
+    with no transform of its own.
+    """
+    p = np.asarray(points, float)
+
+    def _segs(pairs):
+        if pairs.shape[0] == 0:
+            return []
+        a, b = p[pairs[:, 0]], p[pairs[:, 1]]
+        return [[[float(a[i, 0]), float(a[i, 1])],
+                 [float(b[i, 0]), float(b[i, 1])]] for i in range(a.shape[0])]
+
+    sup_pairs = _facet_pairs(m, fixed_facets, N)
+    sup_segs = _segs(sup_pairs)
+    if sup_pairs.shape[0]:
+        sup_xy = 0.5 * (p[sup_pairs[:, 0]] + p[sup_pairs[:, 1]])
+    else:
+        # Degenerate geometry: the solve constrained nodes directly, so draw
+        # the nodes it constrained rather than drawing nothing at all.
+        fx = np.asarray(fixed_nodes, bool)
+        sup_xy = p[fx] if fx.any() else np.zeros((0, 2))
+
+    ld_pairs = _facet_pairs(m, load_facets, N)
+    ld_segs = _segs(ld_pairs)
+    if ld_pairs.shape[0]:
+        ld_xy = 0.5 * (p[ld_pairs[:, 0]] + p[ld_pairs[:, 1]])
+    else:
+        ln = np.asarray(load_nodes, bool)
+        ld_xy = p[ln] if ln.any() else np.zeros((0, 2))
+
+    # The load form is `-trac * v[trans_dof]`, so the force points along the
+    # negative transverse axis. Reporting the sign instead of assuming it in
+    # the browser means the arrow follows the form if the form ever changes.
+    d = [0.0, 0.0]
+    d[trans_dof] = -1.0
+
+    body = (load_case == "ss_dist")
+    if body:
+        # Uniform pressure: there is no loaded edge, so the arrows spread over
+        # the part itself. Interior nodes only -- an arrow rooted on the rim
+        # reads as an edge load, which is exactly what this case is not.
+        try:
+            inner = ~_boundary_nodes(np.asarray(tris), p.shape[0])
+        except Exception:
+            inner = np.ones(p.shape[0], bool)
+        ld_xy = p[inner] if inner.any() else p
+        ld_segs = []
+
+    return {
+        "span_axis": int(ax),
+        "load_axis": int(trans_dof),
+        "load_dir": d,
+        "load_case": load_case,
+        "load_n": float(load),
+        "load_applied_as": applied,
+        "distributed": bool(body),
+        "two_ends": bool(load_case in ("ss_center", "ss_dist", "fixed_fixed")),
+        # stretches of edge that are held, and where to put the hatch glyphs
+        "support_segs": sup_segs,
+        "support_pts": [[float(x), float(y)] for x, y in _spread(sup_xy, 9)],
+        # the loaded edge, and where to root the force arrows
+        "load_segs": ld_segs,
+        "load_pts": [[float(x), float(y)]
+                     for x, y in _spread(ld_xy, 10 if body else 7)],
+        # A sensible glyph size for whoever draws this, in the same units.
+        #
+        # Scaled off the part's SHORTEST dimension, because neither obvious
+        # choice works. The span axis draws 6-pixel stubs on a vertically
+        # spanned part. The longest dimension draws 120-pixel arrows across a
+        # 240-pixel-tall bar, where they run straight off the picture -- the
+        # canvas is the part's bounding box, so there is no margin to spill
+        # into. The short side is what actually bounds the room a glyph has,
+        # whichever way the load points, so it is what sets the size.
+        "glyph_px": float(max(min_px * 0.08, 6.0)),
+        "span_px": float(span_px),
+        "size_px": float(size_px),
+        "min_px": float(min_px),
+    }
+
+
 def solve_plane_stress(points, tris, E=69e9, nu=0.33, thickness=0.00635,
                        load_case="cantilever", orientation="horizontal",
                        load=500.0, m_per_px=1.0):
@@ -388,6 +533,10 @@ def solve_plane_stress(points, tris, E=69e9, nu=0.33, thickness=0.00635,
     f = np.zeros(basis.N)
     applied = "traction"
     load_nodes = np.zeros(N, bool)     # nodes the load is attached to
+    # Kept past the branch below so the load arrows are drawn from the facets
+    # the traction was actually integrated over, not from a second guess at
+    # where the load case "should" have put them.
+    load_facets = np.array([], dtype=np.int64)
 
     def _facet_nodes(fac):
         """Mesh-vertex indices touched by a set of boundary facets."""
@@ -421,6 +570,7 @@ def solve_plane_stress(points, tris, E=69e9, nu=0.33, thickness=0.00635,
             lf = facets_where(lambda x: np.abs(x[ax] - mid) <= band)
         else:                                  # cantilever → free end
             lf = facets_where(lambda x: x[ax] >= s1 - band)
+        load_facets = np.asarray(lf, dtype=np.int64)
         L = _facet_length(m, lf)
         if lf.size and L > 0:
             trac = load / (L * thk)            # N/m^2 on the edge face
@@ -433,6 +583,7 @@ def solve_plane_stress(points, tris, E=69e9, nu=0.33, thickness=0.00635,
         else:
             # No boundary facets in the band (very odd geometry): fall back to
             # lumped nodal forces so the solve still produces something.
+            load_facets = np.array([], dtype=np.int64)
             sel = (coord >= s1 - band) & (~fixed_nodes)
             idx = np.where(sel)[0]
             if idx.size:
@@ -608,7 +759,26 @@ def solve_plane_stress(points, tris, E=69e9, nu=0.33, thickness=0.00635,
     callouts = _callouts(points, np.asarray(tris), vm_pct, vm_norm, keep)
     hole_stress = _hole_stress(points, np.asarray(tris), vm_pct, keep)
 
+    # Where it is held and where the force goes, handed back so the map can
+    # say so out loud. A stress picture with no boundary conditions drawn on
+    # it is not wrong, it is unreadable: the reader cannot tell a hot clamp
+    # from a hot fillet, and cannot check that the load went on the end they
+    # meant. Built from the solve's own facet sets -- see _bc_payload.
+    try:
+        bc = _bc_payload(m, points, np.asarray(tris), N, ax, trans_dof,
+                         load_case, load, fixed_facets, fixed_nodes,
+                         load_facets, load_nodes, applied,
+                         float(np.ptp(points[:, ax])),
+                         float(max(np.ptp(points[:, 0]),
+                                   np.ptp(points[:, 1]))),
+                         float(min(np.ptp(points[:, 0]),
+                                   np.ptp(points[:, 1]))))
+    except Exception as ex:
+        bc = {"error": str(ex)}
+
     return {
+        # supports and load arrows, in the same coordinates as "nodes"
+        "bc": bc,
         "nodes": points.tolist(),
         "tris": np.asarray(tris).tolist(),
         "von_mises": vm_node.tolist(),

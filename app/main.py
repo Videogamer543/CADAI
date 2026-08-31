@@ -174,6 +174,10 @@ async def analyze(
     density: str = Form("normal"),
     load_context: str = Form(""),
     thickness_mm_in: float = Form(0.0),
+    # How finely the part is cut into triangles for the solve. Unrelated to
+    # `density`, which is how much material the POCKETING takes off -- the two
+    # both wanted the word "density" and neither would give it up.
+    mesh_density: str = Form("standard"),
 ):
     data = await limits.read_capped(file)
     name = (file.filename or "").lower()
@@ -280,7 +284,7 @@ async def analyze(
         res = analysis.run(
             data, material=material, mode=mode, load_case=load_case,
             orientation=orientation, load=load, do_pocketing=pocketing,
-            rib_mm=rib_mm, density=density,
+            rib_mm=rib_mm, density=density, mesh_density=mesh_density,
             px_per_mm=px_per_mm, thickness_mm=thickness_mm,
         )
     except Exception as e:

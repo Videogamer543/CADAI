@@ -40,7 +40,7 @@ set /p TK=Tavily API key (starts with tvly-):
 REM --- write .env (this file is git-ignored; keys never reach the browser) ---
 > .env echo # StressViz secrets - keep this file private, never commit or share it.
 >> .env echo GROQ_API_KEY=%GK%
->> .env echo GROQ_MODEL=llama-3.3-70b-versatile
+>> .env echo GROQ_MODEL=openai/gpt-oss-120b
 >> .env echo TAVILY_API_KEY=%TK%
 
 echo.

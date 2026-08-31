@@ -13,6 +13,7 @@ import datetime
 import hashlib
 import hmac
 import time
+import re
 import requests
 
 # The local knowledge base. Imported defensively because chat.py is run both as
@@ -343,8 +344,14 @@ def analyze(question: str, model=None):
     try:
         resp = chat(
             [{"role": "user", "content": "QUESTION: " + question.strip()[:1200]}],
+            # Groq retired llama-3.1-8b-instant on the same day as
+            # llama-3.3-70b-versatile. This call is wrapped in a try/except
+            # that falls back to a default plan, so a 404 here never surfaced
+            # as an error -- the assistant just quietly stopped planning its
+            # searches and got worse at finding things. A silent degradation
+            # is the kind that survives for months.
             model=model or os.environ.get("GROQ_PLANNER_MODEL",
-                                          "llama-3.1-8b-instant"),
+                                          "openai/gpt-oss-20b"),
             temperature=0.0, max_tokens=400, system=prompt,
         )
         raw = resp["choices"][0]["message"]["content"]
@@ -408,6 +415,21 @@ def _groq(messages, model, temperature, max_tokens, system, stream):
         timeout=60,
         stream=bool(stream),
     )
+    # Groq labels the stream `text/event-stream` with no charset, and requests
+    # then follows RFC 2616 and assumes ISO-8859-1 for any text/* that does not
+    # say otherwise. iter_lines(decode_unicode=True) honours that label, so
+    # every multi-byte UTF-8 character in the answer is torn into its
+    # individual bytes: "≈ 73 ksi" comes out as "â‰ˆâ€¯73â€¯ksi".
+    #
+    # This was invisible until the model changed. llama-3.3 wrote plain ASCII;
+    # openai/gpt-oss-120b writes real typography — non-breaking hyphens, narrow
+    # no-break spaces, ≈ — so the bug arrived with the model swap rather than
+    # with any edit to this file, which is why it looked like the new model was
+    # broken.
+    #
+    # Set unconditionally: the non-streaming path goes through .json(), which
+    # already assumes UTF-8, so this makes the two agree rather than diverge.
+    r.encoding = "utf-8"
     if r.status_code >= 400:
         # Surface Groq's own message (bad key, retired model, rate limit)
         # instead of a bare "502 Bad Gateway". Reading .text here consumes the
@@ -419,6 +441,30 @@ def _groq(messages, model, temperature, max_tokens, system, stream):
             msg = r.text[:300]
         raise RuntimeError(f"Groq {r.status_code}: {msg}")
     return r
+
+
+# Typography this model reaches for that is correct but fragile. A narrow
+# no-break space (U+202F) between a number and its unit is what a typesetter
+# would use, and a non-breaking hyphen (U+2011) in "7075-T6" is right too — but
+# they are invisible characters that survive some copy-paste and not others,
+# they land in the saved outputs and the knowledge base, and a reader who
+# pastes "73 ksi" into a spreadsheet gets a cell that will not parse as a
+# number. Folded to their plain equivalents on the way out. Nothing here
+# touches ≈, – or — , which render correctly and carry meaning.
+_TYPO = {
+    "‐": "-", "‑": "-",          # hyphen, non-breaking hyphen
+    " ": " ", " ": " ",          # no-break space, narrow no-break
+    " ": " ", " ": " ", " ": " ",   # figure, thin, hair space
+    "​": "",  "﻿": "",           # zero-width space, stray BOM
+}
+_TYPO_RE = re.compile("[" + "".join(_TYPO) + "]")
+
+
+def detypo(s):
+    """Fold invisible/non-breaking typography to plain ASCII equivalents."""
+    if not s:
+        return s
+    return _TYPO_RE.sub(lambda m: _TYPO[m.group(0)], s)
 
 
 def chat(messages, model=None, temperature=0.3, max_tokens=1024, system=None):
@@ -451,7 +497,9 @@ def chat_stream(messages, model=None, temperature=0.3, max_tokens=1024,
         except Exception:
             continue
         if piece:
-            yield piece
+            # Safe to fold per chunk: every substitution is one codepoint for
+            # one codepoint, so nothing depends on where token boundaries fall.
+            yield detypo(piece)
 
 
 class _MarkerStrip:

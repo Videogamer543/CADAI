@@ -52,32 +52,78 @@ def build(path, target_tets=16000):
         # several times stiffer than it is.
         h = min(h, max(spans[0] / 3.0, 1e-6))
 
-        gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 12)
         gmsh.option.setNumber("Mesh.Algorithm", 6)
         gmsh.option.setNumber("Mesh.Algorithm3D", 1)
         gmsh.option.setNumber("Mesh.Optimize", 1)
 
-        # One corrective pass. Element count scales as h^-3, so a single
-        # cube-root rescale lands close; the guard rails matter more than
-        # precision, because too few elements means a wrong answer and too many
-        # means the solve never finishes.
-        n_tets = 0
-        for attempt in range(2):
-            gmsh.option.setNumber("Mesh.MeshSizeMin", h * 0.22)
-            gmsh.option.setNumber("Mesh.MeshSizeMax", h * 1.6)
+        # The target is a BUDGET, not a wish. Everything downstream is sized
+        # from it: a 3D elasticity matrix factorised by SuperLU costs memory
+        # far faster than linearly in the element count, so a mesh that
+        # overshoots does not merely run slow -- the kernel kills the process
+        # mid-factorisation, which surfaces as a 503 with an empty body and no
+        # traceback anywhere. Nothing in the app can catch that, so it has to
+        # be prevented here.
+        #
+        # The old code did ONE corrective pass and then accepted whatever came
+        # back regardless. On a part with many small round features that is not
+        # close to enough: measured on a 36-tooth pulley asking for 9,000 tets,
+        # pass one gave 115,128 and pass two gave 76,541 -- and 76,541 was
+        # handed to the solver, which is roughly 336,000 quadratic degrees of
+        # freedom and certain death. Iterating properly reaches 13,712.
+        #
+        # Curvature refinement is what fights the budget: MeshSizeFromCurvature
+        # asks for a fixed number of elements around every arc, so forty small
+        # bores can outvote the size field no matter how large h grows. It is
+        # worth having -- it is what keeps a bore round -- so it is relaxed in
+        # steps rather than abandoned, and only when the size field alone has
+        # failed to get under the cap.
+        cap = int(max(target * 1.6, target + 2000))
+        best = None                      # (n_tets, h, curvature) actually met
+        for curv in (12, 6, 0):
+            gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", curv)
+            for _ in range(4):
+                gmsh.option.setNumber("Mesh.MeshSizeMin", h * 0.22)
+                gmsh.option.setNumber("Mesh.MeshSizeMax", h * 1.6)
+                gmsh.model.mesh.clear()
+                gmsh.model.mesh.generate(3)
+                n_tets = 0
+                ets, _, ens = gmsh.model.mesh.getElements(3)
+                for et, en in zip(ets, ens):
+                    if et == 4:
+                        n_tets = len(en) // 4
+                if not n_tets:
+                    break
+                if best is None or n_tets < best[0]:
+                    best = (n_tets, h, curv)
+                if n_tets <= cap and n_tets >= 0.35 * target:
+                    break
+                h *= float(np.clip((n_tets / float(target)) ** (1.0 / 3.0),
+                                   0.45, 2.2))
+            if best and best[0] <= cap:
+                break
+
+        # Last resort: the size field and the curvature setting together could
+        # not get under the budget. Rebuild at the coarsest thing tried, with
+        # curvature off entirely, and if THAT still overshoots, say so plainly
+        # rather than returning a mesh that kills the process that receives it.
+        if best is None or best[0] > cap:
+            gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+            gmsh.option.setNumber("Mesh.MeshSizeMin", h * 0.5)
+            gmsh.option.setNumber("Mesh.MeshSizeMax", h * 3.0)
             gmsh.model.mesh.clear()
             gmsh.model.mesh.generate(3)
-            ets, _, _ = gmsh.model.mesh.getElements(3)
             n_tets = 0
-            for et, en in zip(*[gmsh.model.mesh.getElements(3)[i] for i in (0, 2)]):
+            ets, _, ens = gmsh.model.mesh.getElements(3)
+            for et, en in zip(ets, ens):
                 if et == 4:
                     n_tets = len(en) // 4
-            if attempt or not n_tets:
-                break
-            ratio = n_tets / float(target)
-            if 0.5 <= ratio <= 2.2:
-                break
-            h *= float(np.clip(ratio ** (1.0 / 3.0), 0.45, 2.2))
+            if not n_tets or n_tets > cap * 2:
+                raise RuntimeError(
+                    "this solid could not be meshed inside the element budget "
+                    "(%d tetrahedra, budget %d). It usually means a great many "
+                    "small rounded features -- gear teeth, a bolt circle of "
+                    "tiny holes -- each of which forces its own local "
+                    "refinement." % (n_tets, cap))
 
         tags, coords, _ = gmsh.model.mesh.getNodes()
         coords = np.asarray(coords, float).reshape(-1, 3)

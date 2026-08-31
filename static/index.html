@@ -282,6 +282,20 @@
     <input type="number" id="thick" value="6.35" step="0.25" min="0.3">
     <div id="thickNote" style="font-size:.62rem;color:#737373;margin-top:3px;line-height:1.4"></div>
 
+    <!-- How finely the part is cut into triangles. Exposed rather than fixed
+         because "finer" is not free: the elements are quadratic, so doubling
+         the triangle count roughly doubles the unknowns and more than doubles
+         the solve. Showing the count and the verdict afterwards lets the
+         reader judge the picture instead of being told it is fine. -->
+    <label>Mesh detail<span style="color:#737373;font-weight:400"> — how finely the part is cut into triangles</span></label>
+    <select id="meshDensity">
+      <option value="draft">Draft — fastest, rough at hole rims</option>
+      <option value="standard" selected>Standard</option>
+      <option value="fine">Fine — slower, sharper at fillets and bores</option>
+      <option value="ultra">Very fine — slowest</option>
+    </select>
+    <div id="meshNote" style="font-size:.62rem;color:#737373;margin-top:3px;line-height:1.4"></div>
+
     <label class="ck"><input type="checkbox" id="pocket"><span>Pocketing (2D plates)</span></label>
     <div class="row" id="pocketOpts" style="display:none">
       <div><label>Rib (mm)</label><input type="number" id="rib" value="3" step="0.5"></div>
@@ -289,6 +303,7 @@
     </div>
     <label class="ck" id="outlineRow" style="display:none"><input type="checkbox" id="showCuts" checked onchange="if(lastData)render(lastData)"><span>Outline the pockets on the stress map</span></label>
     <label class="ck"><input type="checkbox" id="showMarks" checked onchange="if(lastData)render(lastData)"><span>Label the stress points</span></label>
+    <label class="ck"><input type="checkbox" id="showBC" checked onchange="if(lastData)render(lastData)"><span>Show where it's held and loaded</span></label>
 
     <button class="run" id="run" disabled onclick="analyze()">▶ Run FEM Analysis</button>
     <div id="status" style="font-size:.66rem;color:#737373;margin-top:9px;line-height:1.5"></div>
@@ -401,9 +416,20 @@
       <canvas id="cv3d" width="900" height="600" style="display:none;cursor:grab;background:radial-gradient(circle at 50% 40%,#151515,#0d0d0d)"></canvas>
       <div id="hint3d" style="position:absolute;left:12px;bottom:10px;display:none;font-size:.66rem;color:#737373;pointer-events:none">left-drag rotate · right-drag move · scroll zoom</div>
       <div id="mapKey"><div class="ttl">STRUCTURAL STRESS MAP</div>
-        <div class="k"><i style="background:#00c846"></i><b>STRONG</b> — low stress, safe to pocket</div>
+        <div class="k"><i style="background:#00c846"></i><b>STRONG</b> — carries little under this load case</div>
         <div class="k"><i style="background:#eab308"></i><b>MODERATE</b> — watch under peak load</div>
         <div class="k"><i style="background:#ff2b2b"></i><b>HIGH STRESS</b> — carries the load, keep material</div>
+        <!-- The reviewer's sharpest point, and he was right. The old green
+             label read "safe to pocket", full stop, while the pocketing plan
+             visibly keeps material around every bolt hole. Either the legend
+             was wrong or the engine was, and a reader has no way to tell
+             which. The engine is right: green means low stress UNDER THE ONE
+             LOAD CASE SOLVED, and a bolt boss is not there to resist that
+             load, it is there to be bolted through. -->
+        <div class="k" style="border:0;padding-left:0;color:#a3a3a3;font-size:.62rem;line-height:1.45">
+          Green is a guideline, not permission. It means low stress under
+          <b>this</b> load case only — mounting bosses, bolt bearing and edges
+          you need for fixturing are kept whatever colour they read.</div>
         <div class="foot" id="mapKeyFoot"></div></div>
       <div id="key3d" style="display:none"><div class="ttl">SOLID STRESS MAP — 3D FEA</div>
         <div class="k"><i style="background:#00c846"></i><b>LOW</b> — carries little; material here is optional</div>
@@ -527,13 +553,70 @@ function sfBasis(d){
    for both at once without either message swallowing the other. */
 function updateMeshWarn(d){
   const el=$('meshWarn'); if(!el) return;
+  const bits=[];
   const note = d && d.tessellation_note;
-  if(!note){ el.style.display='none'; el.innerHTML=''; return }
-  el.style.display='';
-  el.innerHTML='<b>Coarse mesh</b> — '+esc(note)+
+  if(note) bits.push('<b>Coarse silhouette</b> — '+esc(note)+
     '<br><span style="opacity:.85">Treat the removal figure as a floor rather than '+
     'an answer; the finer mesh usually finds more. If this keeps happening the '+
-    'container is most likely short of memory.</span>';
+    'container is most likely short of memory.</span>');
+  // The FEM mesh is a separate question from the tessellation, and it fails in
+  // a way nobody can see: a web with two elements across it cannot represent
+  // bending in that web at all, and the solve reports the mesh rather than the
+  // part. Say the number, because "finer" is not free and the reader is better
+  // served by the count than by reassurance.
+  // 3D solid: the load direction can be undecidable. On a round part the two
+  // longest extents are equal to within meshing noise, so the axis the load
+  // case is built on is chosen by a coin toss that lands differently on every
+  // remesh — and the peak stress follows it. Measured on a pulley: 8.5, then
+  // 22.8, then 1.6 MPa across three mesh densities. That has to be said out
+  // loud, or the number reads as an answer.
+  const ax = d && d.axes;
+  if(ax && ax.span_ambiguous) bits.push(
+    '<b>The load direction is not determined by this shape</b> — its two longest '
+    +'dimensions differ by only '+Math.round(((ax.span_margin||1)-1)*1000)/10+'%, '
+    +'so "along the part" has no single meaning here and the solver picks an axis '
+    +'that can change on a re-run.<br><span style="opacity:.85">Read the field as '
+    +'"where does this shape concentrate stress", not as a number. For a round '
+    +'part, a beam load case is the wrong question.</span>');
+  if(d && d.element_note) bits.push('<b>Solved with linear elements</b> — '+esc(d.element_note));
+  const m = d && d.mesh;
+  if(m && m.verdict==='coarse') bits.push('<b>Mesh too coarse here</b> — '+esc(m.note||'')+
+    '<br><span style="opacity:.85">Raise <b>Mesh detail</b> in the sidebar and run it '+
+    'again before quoting the peak stress or the safety factor.</span>');
+  if(m && m.capped) bits.push(esc(m.cap_note||''));
+  if(!bits.length){ el.style.display='none'; el.innerHTML=''; return }
+  el.style.display='';
+  el.innerHTML=bits.join('<hr style="border:0;border-top:1px solid rgba(255,255,255,.15);margin:6px 0">');
+}
+
+/* Mesh quality in one line under the map, and the same thing under the
+   sidebar control. Element count alone is not the useful number -- 30,000 on
+   a 750 mm rail is coarser than 5,000 on a 60 mm bracket -- so what gets
+   reported is how many elements fit across the thinnest material on the part,
+   which is the dimension that actually has to bend. */
+const MESH_COLOUR={good:'#4ade80',fair:'#fbbf24',coarse:'#f87171'};
+function meshLine(d){
+  const m=d&&d.mesh; if(!m||!m.elements) return '';
+  const c=MESH_COLOUR[m.verdict]||'#a3a3a3';
+  let s='<br><span style="color:#a3a3a3">Mesh: '+m.elements.toLocaleString()+' triangles';
+  if(m.elem_size_mm) s+=' · ~'+m.elem_size_mm.toFixed(2)+' mm each';
+  if(m.adaptive_pass&&m.elements_before_refine)
+    s+=' · refined from '+m.elements_before_refine.toLocaleString();
+  if(m.elements_across_thinnest)
+    s+=' · <span style="color:'+c+'">'+m.elements_across_thinnest.toFixed(1)+
+       ' across the thinnest section</span>';
+  return s+'</span>';
+}
+
+/* Same information beside the control that sets it, so the next choice is an
+   informed one rather than a guess. */
+function updateMeshNote(d){
+  const el=$('meshNote'); if(!el) return;
+  const m=d&&d.mesh;
+  if(!m||!m.elements){ el.textContent=''; return }
+  const c=MESH_COLOUR[m.verdict]||'#a3a3a3';
+  el.innerHTML='Last run: '+m.elements.toLocaleString()+' triangles · '+
+    '<span style="color:'+c+'">'+esc(m.note||m.verdict||'')+'</span>';
 }
 
 /* Full-width, selectable, and it does NOT truncate. The sidebar keeps a one
@@ -987,6 +1070,7 @@ async function analyze(){
   fd.append('pocketing',$('pocket').checked);
   fd.append('rib_mm',$('rib').value);
   fd.append('density',$('density').value);
+  fd.append('mesh_density',$('meshDensity').value);
   fd.append('thickness_mm_in',$('thick').value||0);
   // The text goes to the server too: whatever it states beats the dropdowns,
   // so running without pressing "Read this" first still honours what you wrote.
@@ -1019,6 +1103,7 @@ async function analyze(){
     $('meta').innerHTML=`peak σ ${(d.peak_vm/1e6).toFixed(2)} MPa${sf}`+sfBasis(d);
     updateSfWarn(d);
     updateMeshWarn(d);
+    updateMeshNote(d);
     drawLegend(d);
     showView(d.pocket_png_data?'pocket':'stress');
   }catch(e){showError(e.message||String(e), 0, e.name||'')}
@@ -1365,6 +1450,139 @@ function drawHoleStress(ctx,d,s){
   ctx.restore();
 }
 
+/* ================= boundary conditions on the map =======================
+   Where the part is HELD and where the FORCE goes, drawn from d.bc — which
+   the solver builds out of the facet sets it actually condensed and actually
+   integrated the traction over, not from a second reading of the dropdowns.
+   That distinction is the whole point: a picture re-derived from the settings
+   can quietly disagree with the maths that produced the colours, and the
+   reader has no way to tell.
+
+   The canvas is sized to the image, so node coordinates ARE canvas pixels and
+   no transform is needed. `s` is the same badge scale the callouts use, so
+   the arrows stay legible on a 400 px part and on a 1500 px one.          */
+const BC_SUP='#ffffff', BC_LOAD='#ffd166', BC_HALO='rgba(11,11,11,.55)';
+
+function bcStroke(ctx,path,colour,w){
+  ctx.lineCap='round';ctx.lineJoin='round';
+  ctx.strokeStyle=BC_HALO;ctx.lineWidth=w+3;path();
+  ctx.strokeStyle=colour;ctx.lineWidth=w;path();
+}
+
+/* Clamped into the canvas. A support on the left edge of the part sits at the
+   left edge of the picture, and a label reading "ld here" is worse than none. */
+function bcPill(ctx,text,px,py,align,s){
+  const fs=Math.round(12*s);
+  ctx.font='600 '+fs+'px system-ui,Segoe UI,sans-serif';
+  const w=ctx.measureText(text).width+10*s, h=fs+8*s;
+  let x=px-w/2; if(align==='left')x=px+8*s; if(align==='right')x=px-w-8*s;
+  let y=py-h/2;
+  x=Math.max(4,Math.min(x,ctx.canvas.width-w-4));
+  y=Math.max(4,Math.min(y,ctx.canvas.height-h-4));
+  ctx.fillStyle='rgba(11,11,11,.82)';
+  if(ctx.roundRect){ctx.beginPath();ctx.roundRect(x,y,w,h,5*s);ctx.fill()}
+  else ctx.fillRect(x,y,w,h);
+  ctx.fillStyle='#fff';ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText(text,x+w/2,y+h/2);
+}
+
+/* The canvas is exactly the part's bounding box — there is no margin to spill
+   into — so every glyph that points outward has to be shortened rather than
+   drawn off the edge. Returns the far end of a segment from `p` along `d`,
+   trimmed to whatever actually fits. */
+function bcFit(ctx,p,d,len,inset){
+  let L=len;
+  for(let i=0;i<2;i++){
+    if(!d[i])continue;
+    const lim = d[i]>0 ? (ctx.canvas[i?'height':'width']-inset-p[i]) : (p[i]-inset);
+    if(lim<L*Math.abs(d[i])) L=Math.max(0,lim/Math.abs(d[i]));
+  }
+  return [p[0]+d[0]*L, p[1]+d[1]*L, L];
+}
+
+function drawBC(ctx,bc,s){
+  if(!bc||bc.error)return;
+  const g=(bc.glyph_px||10);
+  ctx.save();
+
+  // the held edge itself
+  const segs=bc.support_segs||[];
+  if(segs.length) bcStroke(ctx,()=>{
+    ctx.beginPath();
+    for(const q of segs){ctx.moveTo(q[0][0],q[0][1]);ctx.lineTo(q[1][0],q[1][1])}
+    ctx.stroke();
+  },BC_SUP,3.5*s);
+
+  /* Hatch ticks leaning away from the part, the way a fixed support is drawn
+     on any free-body diagram. "Away" comes from the span axis: a support sits
+     at the low end of the span, and on a two-ended case at the high end too. */
+  const sup=bc.support_pts||[], ax=bc.span_axis|0;
+  if(sup.length){
+    let lo=Infinity,hi=-Infinity;
+    for(const p of sup){const v=p[ax];if(v<lo)lo=v;if(v>hi)hi=v}
+    const mid=.5*(lo+hi);
+    for(const p of sup){
+      const out=(bc.two_ends&&p[ax]>mid)?1:-1, dv=[0,0];
+      dv[ax]=out*0.707; dv[1-ax]=0.707;                 // 45 degrees, away
+      const t=bcFit(ctx,p,dv,g*1.27,2);
+      if(t[2]<3) continue;                              // no room: skip the tick
+      bcStroke(ctx,()=>{ctx.beginPath();ctx.moveTo(p[0],p[1]);ctx.lineTo(t[0],t[1]);ctx.stroke()},BC_SUP,2*s);
+    }
+  }
+
+  /* Load arrows END on the loaded edge and fly in from upstream, so the head
+     lands where the force is applied rather than floating past it. */
+  const dir=bc.load_dir||[0,-1], pts=bc.load_pts||[];
+  const len=g*(bc.distributed?1.5:2.6), hw=Math.max(4,g*0.42);
+  for(const p of pts){
+    // The tail flies in from upstream, so it is what gets trimmed when the
+    // arrow would leave the picture — the head stays on the loaded edge where
+    // the force is actually applied, which is the part that carries meaning.
+    const back=bcFit(ctx,p,[-dir[0],-dir[1]],len,2);
+    if(back[2]<hw*2.2) continue;
+    const tx=back[0], ty=back[1];
+    const ux=p[0]-tx, uy=p[1]-ty, m=Math.hypot(ux,uy)||1, hx=ux/m, hy=uy/m;
+    bcStroke(ctx,()=>{ctx.beginPath();ctx.moveTo(tx,ty);
+      ctx.lineTo(p[0]-hx*hw,p[1]-hy*hw);ctx.stroke()},BC_LOAD,3*s);
+    ctx.beginPath();
+    ctx.moveTo(p[0],p[1]);
+    ctx.lineTo(p[0]-hx*hw*1.8-hy*hw*.62, p[1]-hy*hw*1.8+hx*hw*.62);
+    ctx.lineTo(p[0]-hx*hw*1.8+hy*hw*.62, p[1]-hy*hw*1.8-hx*hw*.62);
+    ctx.closePath();
+    ctx.strokeStyle='#0b0b0b';ctx.lineWidth=2.5*s;ctx.stroke();
+    ctx.fillStyle=BC_LOAD;ctx.fill();
+  }
+
+  // Labels sit behind an END arrow, never the middle one — the middle of a fan
+  // is the one place guaranteed to have arrows on both sides of it.
+  if(sup.length) bcPill(ctx, bc.two_ends?'Held (both ends)':'Held here',
+                        sup[0][0], sup[0][1], ax===0?'right':'center', s);
+  if(pts.length){
+    const q=bc.distributed?pts[0]:pts[pts.length-1];
+    const n=Math.round(bc.load_n||0);
+    bcPill(ctx, bc.distributed?(n+' N spread over the part'):(n+' N'),
+           q[0]-dir[0]*len*2, q[1]-dir[1]*len*2, 'center', s);
+  }
+  ctx.restore();
+}
+
+/* One line of plain English under the map, so the picture is explained in
+   words as well as arrows. */
+function bcSentence(bc){
+  if(!bc||bc.error)return'';
+  const n=Math.round(bc.load_n||0);
+  const held=bc.two_ends?'held at both ends':'held at one end';
+  const how=bc.distributed?(n+' N spread evenly over the whole part')
+    :((bc.load_case==='ss_center'||bc.load_case==='fixed_fixed')
+      ?(n+' N pushing on the middle'):(n+' N pushing on the free end'));
+  const caveat=(bc.load_applied_as||'').indexOf('lumped')>=0
+    ? ' The solver found no clean edge to load, so the force was attached to'
+      +' individual points — read the peak near the load with care.' : '';
+  return '<br><span style="color:#a3a3a3">'
+    +'<span style="color:#fff">▬</span> where it is '+held+' &nbsp; '
+    +'<span style="color:#ffd166">➜</span> the load: '+how+esc(caveat)+'</span>';
+}
+
 function render(d){
   demoOff();
   const cv=$('cv'),ctx=cv.getContext('2d');const[W,H]=d.image_size;
@@ -1408,6 +1626,9 @@ function render(d){
     for(const m of ms) drawDot(ctx,m,s);
     for(const p of layoutBadges(ctx,ms,W,H,s)) if(p.box) drawBadge(ctx,p.m,W,H,s,p.box);
   }
+  // Last, so supports and load arrows sit over the badges rather than under
+  // them: they are the frame the rest of the picture has to be read inside.
+  if($('showBC').checked) drawBC(ctx,d.bc,s);
   drawMapKey(d);
 }
 
@@ -1456,6 +1677,7 @@ function stressNoteHTML(d){
     '<br><span style="color:#a3a3a3">'+
     (CASE_TEXT[d.load_case]||d.load_case||'')+' · '+
     (d.orientation||'horizontal')+' axis'+(drv?' · '+drv:'')+'</span>'+
+    bcSentence(d.bc)+meshLine(d)+
     zoneLine(d);
 }
 
@@ -1699,8 +1921,9 @@ function legendFor(v){
 function bandAt(d,v){
   const t=d.pocket_thresholds||{pocket:0.45,keep:0.55};
   if(v<t.pocket) return {h:'STRONG',c:'#4ade80',
-    sub:'Low stress — this material is along for the ride.',
-    act:d.pocketing?'The engine pockets here.':'Safe to pocket.'};
+    sub:'Low stress under this load case — this material is along for the ride.',
+    act:d.pocketing?'The engine pockets here, except where a bolt or boss needs the material.'
+                   :'A pocketing candidate — unless it is carrying a fastener or a fixture.'};
   if(v<t.keep) return {h:'CAUTION: Transition Zone',c:'#fbbf24',
     sub:'Moderate stress — carries some load.',
     act:'Machine with care; leave a rib if you cut into it.'};
