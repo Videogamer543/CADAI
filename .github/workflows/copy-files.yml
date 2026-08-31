@@ -15,10 +15,11 @@ jobs:
         env:
           API_TOKEN_GITHUB: ${{ secrets.COPY_TOKEN }}
         with:
-          source_file: 'README.md' # Start by testing with just ONE file to make sure it works!
-          destination_repo: 'Videogamer543/CADAI--Lovable-' 
-          destination_folder: '/' # Forces it to look at the root directory of the target repo
-          user_email: 'jcshuang1109@gmail.com' # Make sure this matches your real email
+          source_file: './' # Selects all files and folders in the current directory
+          destination_repo: 'Videogamer543/CADAI--Lovable-'
+          destination_folder: '/' # Drops them directly into the root folder of the target repo
+          user_email: 'jcshuang1109@gmail.com' # Replace with your real GitHub email
           user_name: 'Videogamer543'
-          commit_message: 'Automated file copy'
+          commit_message: 'Automated full repository copy'
+
 
