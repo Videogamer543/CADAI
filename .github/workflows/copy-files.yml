@@ -1,7 +1,7 @@
-name: Copy Files to Another Repo
+name: Copy All Files to Another Repo
 on:
   push:
-    branches: [ main ] # Runs every time you push to the main branch
+    branches: [ main ]
 
 jobs:
   copy-files:
@@ -10,16 +10,31 @@ jobs:
       - name: Checkout Source Repo
         uses: actions/checkout@v4
 
-      - name: Pushes Files to Destination Repo
-        uses: dmnemec/copy_file_to_another_repo_action@main
+      - name: Copy and Push to Target Repo
         env:
           API_TOKEN_GITHUB: ${{ secrets.COPY_TOKEN }}
-        with:
-          source_file: './' # Selects all files and folders in the current directory
-          destination_repo: 'Videogamer543/CADAI--Lovable-'
-          destination_folder: '/' # Drops them directly into the root folder of the target repo
-          user_email: 'jcshuang1109@gmail.com' # Replace with your real GitHub email
-          user_name: 'Videogamer543'
-          commit_message: 'Automated full repository copy'
+        run: |
+          # 1. Setup git credentials
+          git config --global user.email "jcshuang1109@gmail.com"
+          git config --global user.name "Videogamer543"
+          
+          # 2. Clone the destination repo into a temporary folder
+          git clone https://x-access-token:${API_TOKEN_GITHUB}@://github.com /tmp/target-repo
+          
+          # 3. Clean out the temporary target folder (excluding its hidden .git folder)
+          find /tmp/target-repo -maxdepth 1 ! -name '.git' ! -name 'target-repo' -exec rm -rf {} +
+          
+          # 4. Copy everything from source to target (excluding the source's hidden git/actions data)
+          rsync -av --exclude='.git' --exclude='.github' ./ /tmp/target-repo/
+          
+          # 5. Commit and push directly to the target repo
+          cd /tmp/target-repo
+          git add -A
+          if git diff-index --quiet HEAD --; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "Automated full repository sync from CADAI"
+          git push origin main
 
 
