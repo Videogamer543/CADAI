@@ -12,22 +12,23 @@ jobs:
 
       - name: Copy and Push to Target Repo
         env:
+          # This securely loads your secret token into an environment variable
           API_TOKEN_GITHUB: ${{ secrets.COPY_TOKEN }}
         run: |
-          # 1. Setup git credentials (using a standard bot email format)
+          # 1. Setup git credentials
           git config --global user.email "github-actions[bot]@://github.com"
           git config --global user.name "github-actions[bot]"
           
-          # 2. Clone the destination repo into a temporary folder
-          git clone https://x-access-token:${API_TOKEN_GITHUB}@://github.com /tmp/target-repo
+          # 2. Clone using the environment variable outside of the direct string
+          git clone "https://x-access-token:$API_TOKEN_GITHUB@://github.com" /tmp/target-repo
           
-          # 3. Clean out the temporary target folder (excluding its hidden .git folder)
+          # 3. Clean out target folder (excluding its hidden .git folder)
           find /tmp/target-repo -maxdepth 1 ! -name '.git' ! -name 'target-repo' -exec rm -rf {} +
           
-          # 4. Copy everything from source to target (excluding the source's hidden git/actions data)
+          # 4. Copy files over (excluding source git metadata)
           rsync -av --exclude='.git' --exclude='.github' ./ /tmp/target-repo/
           
-          # 5. Commit and push directly to the target repo
+          # 5. Commit and push changes
           cd /tmp/target-repo
           git add -A
           if git diff-index --quiet HEAD --; then
@@ -35,4 +36,5 @@ jobs:
             exit 0
           fi
           git commit -m "Automated full repository sync from CADAI"
-          git push origin main 
+          git push origin main
+
