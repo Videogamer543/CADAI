@@ -14,9 +14,9 @@ jobs:
         env:
           API_TOKEN_GITHUB: ${{ secrets.COPY_TOKEN }}
         run: |
-          # 1. Setup git credentials
-          git config --global user.email "jcshuang1109@gmail.com"
-          git config --global user.name "Videogamer543"
+          # 1. Setup git credentials (using a standard bot email format)
+          git config --global user.email "github-actions[bot]@://github.com"
+          git config --global user.name "github-actions[bot]"
           
           # 2. Clone the destination repo into a temporary folder
           git clone https://x-access-token:${API_TOKEN_GITHUB}@://github.com /tmp/target-repo
@@ -36,5 +36,3 @@ jobs:
           fi
           git commit -m "Automated full repository sync from CADAI"
           git push origin main
-
-
