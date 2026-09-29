@@ -579,6 +579,10 @@ function updateMeshWarn(d){
     +'"where does this shape concentrate stress", not as a number. For a round '
     +'part, a beam load case is the wrong question.</span>');
   if(d && d.element_note) bits.push('<b>Solved with linear elements</b> — '+esc(d.element_note));
+  // The volume mesher fell back. Said out loud for the same reason the
+  // tessellation ladder says it: a degraded mesh that looks clean is worse
+  // than one that admits what it is.
+  if(d && d.mesh_note) bits.push('<b>Fallback mesh</b> — '+esc(d.mesh_note));
   const m = d && d.mesh;
   if(m && m.verdict==='coarse') bits.push('<b>Mesh too coarse here</b> — '+esc(m.note||'')+
     '<br><span style="opacity:.85">Raise <b>Mesh detail</b> in the sidebar and run it '+

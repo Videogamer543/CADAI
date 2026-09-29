@@ -63,7 +63,23 @@ SYSTEM_PROMPT = (
     "- If NO SOURCES block is present, write the answer with NO bracketed "
     "numbers at all, and open with one short line saying the answer is from "
     "general engineering knowledge rather than retrieved sources.\n"
+    "- That disclosure covers general principles ONLY. Never give a street "
+    "address, phone number, opening hours, price, stock level or whether a "
+    "business is open unless it appears verbatim in a SOURCE. Without one, "
+    "say you cannot verify it and tell the reader to check the vendor's own "
+    "site or Google Maps. A fluent guess at an address is worse than no "
+    "answer, because it reads as checked.\n"
     "- Never invent a source, a URL, or a citation number.\n\n"
+    "\nHOW TO WRITE IT\n"
+    "- Never use a markdown table. Tables do not render in this panel and "
+    "arrive as a wall of pipe characters. Compare things in a sentence, or "
+    "as short bullets: '6061-T6 yields around 275 MPa; 7075-T6 about "
+    "twice that at 503 MPa.'\n"
+    "- Write like an engineer explaining something at a bench: short "
+    "paragraphs, plain words, no headings unless the answer really has "
+    "parts. Bullets only where the content is genuinely a list.\n"
+    "- Lead with the answer, then the reasoning. Do not restate the "
+    "question, and do not bold whole sentences.\n\n"
     "When the sources include a page that answers the question directly, lead "
     "with what that page actually says rather than generic advice. Prefer "
     "datasheets, MatWeb, ASM, .edu and official vendor docs for engineering "
@@ -1396,6 +1412,60 @@ def gather(question, topics, domains, analysis=None, timing=None):
     return pool[:keep], used_queries
 
 
+# Questions whose answer is a fact about the CURRENT world rather than about
+# engineering: who sells a thing, where they are, what it costs, whether they
+# are open. A language model cannot know any of it. It can, however, produce
+# it fluently, and that is exactly what went wrong: asked for aluminium vendors
+# in San Jose the assistant returned a table listing 1150, 1500, 2000 and 3000
+# S. Bascom Ave -- four evenly spaced round numbers on one street, every one
+# invented, plus a fabricated claim that two of them "share a facility". The
+# real shop was on Zanker Rd and had closed permanently.
+#
+# The disclosure line ("from general engineering knowledge") did not save it.
+# Saying a table of street addresses is unsourced does not stop a reader using
+# the addresses. So this is a refusal, not a caveat: with no retrieved source,
+# these questions get an honest short answer instead of a confident wrong one.
+PERISHABLE_RE = re.compile(
+    r"\b(vendor|vendors|supplier|suppliers|distributor|store|shop|shops|"
+    r"buy|purchase|sell|sells|selling|stock|in stock|near me|nearby|local|"
+    r"address|phone|hours|open|closed|price|prices|cost|quote|"
+    r"where can i (?:get|buy|find))\b", re.I)
+# ...but only when the question is anchored to a place or a purchase.
+PLACE_RE = re.compile(
+    r"\b(near|nearby|local|in|around|closest|nearest)\b.{0,40}"
+    r"[A-Z][a-z]+|\b(ca|california|usa|city|county)\b", re.I)
+
+
+def is_perishable(question):
+    """Does answering this require knowing the world as it is today?"""
+    q = question or ""
+    if not PERISHABLE_RE.search(q):
+        return False
+    return bool(PLACE_RE.search(q)) or bool(
+        re.search(r"\b(price|cost|quote|in stock|hours|open|closed|phone|"
+                  r"address)\b", q, re.I))
+
+
+PERISHABLE_REFUSAL = (
+    "I can't answer this one reliably.\n\n"
+    "Questions about who stocks a material, where they are, what they charge "
+    "or whether they're open are facts about the world right now. I have no "
+    "live source for them here, and a plausible-looking list of shops and "
+    "street addresses is worse than no list -- it reads as checked when it "
+    "isn't.\n\n"
+    "What actually works for this:\n\n"
+    "- Search the supplier directly and use the address on their own site. "
+    "Metal Supermarkets, Industrial Metal Supply, Alro and Online Metals all "
+    "publish branch pages.\n"
+    "- Check the branch on Google Maps before driving out. Locations close, "
+    "and a listing can be months stale.\n"
+    "- Call ahead for stock and cut fees. Neither is ever published "
+    "accurately.\n\n"
+    "What I can help with is the engineering side: which alloy and temper you "
+    "want, what stock size to ask for, and what tolerance to specify."
+)
+
+
 def ask(question, model=None):
     """Answer the question and return the whole thing at once.
 
@@ -1586,6 +1656,16 @@ def ask_stream(question, model=None):
     # turns a blank wait into a visible one.
     n_src = len(sources)
     yield {"type": "plan", "plan": plan_meta, "sources": sources}
+
+    # Nothing retrieved, and the question needs today's world rather than
+    # engineering. Answer honestly instead of letting the model improvise
+    # addresses. See PERISHABLE_REFUSAL for what this is preventing.
+    if n_src == 0 and is_perishable(question):
+        yield {"type": "delta", "text": PERISHABLE_REFUSAL}
+        yield {"type": "done", "result": {
+            "answer": PERISHABLE_REFUSAL, "sources": [],
+            "plan": plan_meta, "refused": "no live source for a local fact"}}
+        return
 
     yield {"type": "stage", "stage": "answer"}
     _t0 = time.time()

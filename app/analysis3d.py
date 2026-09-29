@@ -115,7 +115,11 @@ def _mesh_step(data: bytes, target_tets: int = TARGET_TETS):
         with np.load(out) as d:
             nodes = np.array(d["nodes"], dtype=np.float64)
             tets = np.array(d["tets"]).astype(np.int64)
-        return nodes, tets
+            # Which rung of app/vol_worker.STRATEGIES produced this. Empty on
+            # the standard path; a sentence when a fallback was needed, so a
+            # degraded mesh cannot pass itself off as a clean one.
+            note = str(d["note"]) if "note" in d.files else ""
+        return nodes, tets, note
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
@@ -205,7 +209,9 @@ def run(data: bytes, *, filename="part", material="Aluminum 6061-T6",
             "no answer at all.")
 
     if name.endswith(".step") or name.endswith(".stp"):
-        nodes_mm, tets = _mesh_step(data, target_tets)
+        nodes_mm, tets, _mesh_note = _mesh_step(data, target_tets)
+        if _mesh_note:
+            extra["mesh_note"] = _mesh_note
         extra["geometry_source"] = "STEP solid (true 3D geometry)"
         # The typed thickness has no effect on this path -- the solver is
         # chewing the real solid, so the number is a readout, not an input. It

@@ -447,7 +447,15 @@ def measure_tess(tess, spec=None, out_px=WORK_PX):
     whether a pocketing plan is machinable in the stock you actually have.
     """
     spec = spec or {}
-    tris = np.asarray(tess["tris"], dtype=np.float64)
+    # step3d.faces() rather than tess["tris"] directly: app/step_worker.py now
+    # ships INDEXED geometry -- a shared vertex table plus integer triangles --
+    # and reading that as coordinates silently yields an (M, 3) array of indices
+    # where an (M, 3, 3) array of points is expected. The failure lands a long
+    # way from the cause: every part in the folder skips with "incompatible
+    # dimensions for cross product", and the fit then reports nothing to
+    # compare. One helper knows both shapes, so everything goes through it.
+    from app import step3d as _s3d
+    tris = _s3d.faces(tess)
     if tris.size == 0:
         raise ValueError("empty tessellation")
     verts = tris.reshape(-1, 3)
