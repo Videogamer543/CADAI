@@ -70,6 +70,16 @@ SYSTEM_PROMPT = (
     "site or Google Maps. A fluent guess at an address is worse than no "
     "answer, because it reads as checked.\n"
     "- Never invent a source, a URL, or a citation number.\n\n"
+    "\nVENDORS, PLACES AND PRICES\n"
+    "- Name the supplier and link its own site. Give an address, phone "
+    "number or opening hours ONLY if a source states it; otherwise say which "
+    "branch to look up and leave it there.\n"
+    "- Say plainly that branches close and listings go stale, and that the "
+    "vendor's own site or Google Maps is what to check before driving out. "
+    "This is not boilerplate: a San Jose branch this tool once recommended "
+    "had shut permanently.\n"
+    "- Never infer one address from another, and never claim two businesses "
+    "share premises.\n\n"
     "\nHOW TO WRITE IT\n"
     "- Never use a markdown table. Tables do not render in this panel and "
     "arrive as a wall of pipe characters. Compare things in a sentence, or "
@@ -192,6 +202,26 @@ ROUTES = [
      ["motors.vex.com", "docs.wpilib.org", "docs.revrobotics.com",
       "ctr-electronics.com", "vexrobotics.com", "wcproducts.com",
       "sdp-si.com", "gates.com"]),
+    # Where to buy metal, and what it costs. This route did not exist, and its
+    # absence is why "sheet aluminium vendors in San Jose" came back unsourced:
+    # every other route steers Tavily at frcdesign, WPILib and McMaster, so a
+    # supplier's own branch page was never in the allowlist and never survived
+    # scoring. With nothing retrieved the model answered from memory and
+    # invented four addresses on one street.
+    #
+    # The domains are the suppliers' OWN sites on purpose. A branch page is the
+    # one source that is both authoritative about its own address and updated
+    # when that address changes -- which a directory listing is not, as the
+    # permanently-closed San Jose branch showed.
+    ("metal stock and suppliers", [
+        r"\b(vendor|vendors|supplier|suppliers|distributor|stockist|"
+        r"where (?:can|do) i (?:buy|get|find)|buy|purchase|price|prices|"
+        r"cost|quote|in stock|stocked|sheet|plate|bar stock|extrusion|"
+        r"remnant|drop|cut.to.size|will.call)\b"],
+     ["metalsupermarkets.com", "industrialmetalsupply.com", "onlinemetals.com",
+      "mcmaster.com", "alro.com", "speedymetals.com", "midweststeelsupply.com",
+      "discountsteel.com", "sendcutsend.com", "protocase.com", "oshcut.com",
+      "alcobrametals.com", "coastaluminum.com"]),
     ("fasteners and bearings", [
         r"\b(bearing|flanged|thrust|bushing|shoulder ?bolt|rivet|helicoil|"
         r"heli-?coil|thread|tap|10-32|1/4-20|8-32|m3|m5|loctite|nyloc|"
@@ -625,6 +655,14 @@ def _plan_queries(question, topics, domains, analysis=None):
             return
         seen.add(key)
         plan.append({"q": q, "domains": doms, "raw": raw, "n": n, "tag": tag})
+
+    # A question about the world as it is today always gets an unrestricted
+    # open-web search, whatever the router decided. The allowlist is what makes
+    # engineering answers trustworthy and it is exactly what starves a vendor
+    # question, so this is the one case where it gets stepped around rather
+    # than narrowed.
+    if is_perishable(question):
+        add(question, None, False, 8, "open web (live fact)")
 
     aq = list((analysis or {}).get("queries") or [])
     if aq:
