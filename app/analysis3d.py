@@ -102,23 +102,44 @@ def _mesh_step(data: bytes, target_tets: int = TARGET_TETS):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         env = dict(os.environ)
         env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
-        r = subprocess.run(
-            [sys.executable, "-m", "app.vol_worker", sp, out, str(int(target_tets))],
-            cwd=root, env=env, capture_output=True, timeout=300)
-        if r.returncode != 0 or not os.path.exists(out):
+        # Walk the strategy ladder, ONE SUBPROCESS PER RUNG. gmsh cannot be
+        # reset in-process after a failed 3D boundary recovery -- a previous
+        # version tried, and every rung after the first then failed with the
+        # same "no tetrahedra produced" regardless of its settings, which is
+        # the signature of a poisoned session rather than of the geometry. A
+        # fresh interpreter is the only reliable reset, and it costs one
+        # process start per attempt.
+        from .vol_worker import STRATEGIES
+        errs, note = [], ""
+        nodes = tets = None
+        for i in range(len(STRATEGIES)):
+            r = subprocess.run(
+                [sys.executable, "-m", "app.vol_worker", sp, out,
+                 str(int(target_tets)), str(i)],
+                cwd=root, env=env, capture_output=True, timeout=300)
+            if r.returncode == 0 and os.path.exists(out):
+                with np.load(out) as d:
+                    nodes = np.array(d["nodes"], dtype=np.float64)
+                    tets = np.array(d["tets"]).astype(np.int64)
+                    label = str(d["note"]) if "note" in d.files else ""
+                if i:
+                    note = ("meshed with the '%s' fallback: the standard "
+                            "settings could not mesh this solid (%s). The "
+                            "stress field is real; treat fine detail near "
+                            "small features with a little caution."
+                            % (label or STRATEGIES[i][0], errs[0]))
+                break
             err = (r.stderr or b"").decode("utf8", "replace").strip()
-            raise RuntimeError(err.splitlines()[-1] if err else
-                               "volume mesher failed with no message")
-        # np.copy, not the bare member: the array a lazy NpzFile hands out is
-        # already materialised, but being explicit here is what documents that
-        # nothing may outlive the `with`.
-        with np.load(out) as d:
-            nodes = np.array(d["nodes"], dtype=np.float64)
-            tets = np.array(d["tets"]).astype(np.int64)
-            # Which rung of app/vol_worker.STRATEGIES produced this. Empty on
-            # the standard path; a sentence when a fallback was needed, so a
-            # degraded mesh cannot pass itself off as a clean one.
-            note = str(d["note"]) if "note" in d.files else ""
+            last = err.splitlines()[-1] if err else "no message"
+            errs.append("%s: %s" % (STRATEGIES[i][0], last[:110]))
+            try:
+                os.unlink(out)
+            except Exception:
+                pass
+        if nodes is None:
+            raise RuntimeError(
+                "volume meshing failed at every setting. Attempts -- "
+                + " | ".join(errs))
         return nodes, tets, note
     finally:
         shutil.rmtree(td, ignore_errors=True)

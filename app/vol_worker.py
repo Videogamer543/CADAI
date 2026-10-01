@@ -57,6 +57,12 @@ STRATEGIES = (
     ("reduced curvature",       6, 10, 0.35, 0.02),
     ("curvature off",           0, 10, 0.50, 0.02),
     ("curvature off, coarse",   0,  1, 0.60, 0.02),
+    # Last resort, and only here. OCC healing removes small faces, which on a
+    # pulley is most of the part -- measured once at 104 seconds for zero
+    # tetrahedra. But by this rung every other setting has already produced
+    # zero, so a slow long shot costs nothing that is not already lost, and a
+    # genuinely self-intersecting STEP is exactly what it exists to repair.
+    ("geometry healing",        0,  1, 0.60, 0.02, True),
 )
 
 
@@ -80,14 +86,18 @@ def _count_tets(gmsh):
     return 0
 
 
-def _attempt(gmsh, path, target_tets, curv, alg3d, minf, facet_tol):
+def _attempt(gmsh, path, target_tets, curv, alg3d, minf, facet_tol, heal=False):
     """One rung. Opens the model fresh, meshes to budget, returns the arrays.
 
     Re-opening rather than re-meshing the loaded model is deliberate: a failed
     boundary recovery leaves gmsh's internal state partly built, and reusing it
     makes the next rung fail for reasons belonging to the previous one.
     """
-    gmsh.clear()
+    if heal:
+        gmsh.option.setNumber("Geometry.OCCFixDegenerated", 1)
+        gmsh.option.setNumber("Geometry.OCCFixSmallEdges", 1)
+        gmsh.option.setNumber("Geometry.OCCFixSmallFaces", 1)
+        gmsh.option.setNumber("Geometry.OCCSewFaces", 1)
     gmsh.open(path)
     gmsh.model.occ.synchronize()
 
@@ -164,58 +174,58 @@ def _attempt(gmsh, path, target_tets, curv, alg3d, minf, facet_tol):
     return coords, tets, surf
 
 
-def build(path, target_tets=16000):
-    """STEP path -> (nodes, tets, surface tris, note). Tries the ladder."""
+def build(path, target_tets=16000, strategy=0):
+    """Run ONE strategy, in this process, and return its mesh.
+
+    The ladder deliberately does NOT live in here any more. It used to: one
+    gmsh.initialize() with gmsh.clear() between rungs. That looked tidy and was
+    wrong, and the failure it produced was unmistakable once a real part hit it:
+
+        standard: Invalid boundary mesh (overlapping facets) on surface 233
+        HXT boundary recovery: no tetrahedra produced
+        relaxed overlap test:  no tetrahedra produced
+        reduced curvature:     no tetrahedra produced
+        curvature off:         no tetrahedra produced
+        curvature off, coarse: no tetrahedra produced
+
+    The first message is about the part. The next five are identical and are
+    about gmsh. A 3D boundary recovery that fails leaves the model half-built,
+    and gmsh.clear() plus a re-open does not undo it -- so rungs two through six
+    were not testing the geometry at all, they were testing a poisoned session.
+
+    One strategy per interpreter is the only reliable reset. app/analysis3d.py
+    walks the ladder by invoking this module once per rung, which costs a
+    process start per attempt and buys an attempt that actually means
+    something. It is the same reasoning that put gmsh in a subprocess to begin
+    with, applied one level further down.
+    """
     import gmsh
+    spec = STRATEGIES[max(0, min(int(strategy), len(STRATEGIES) - 1))]
+    label, curv, alg3d, minf, tol = spec[:5]
+    heal = bool(spec[5]) if len(spec) > 5 else False
     gmsh.initialize()
     try:
         gmsh.option.setNumber("General.Terminal", 0)
-        errs = []
-        budget_only = True          # has every escalation so far been size?
-        for i, (label, curv, alg3d, minf, tol) in enumerate(STRATEGIES):
-            try:
-                coords, tets, surf = _attempt(gmsh, path, target_tets,
-                                              curv, alg3d, minf, tol)
-            except BudgetExceeded as e:
-                errs.append("%s: %s" % (label, e))
-                budget_only = budget_only and True
-                continue
-            except Exception as e:
-                errs.append("%s: %s" % (label, str(e)[:110]))
-                budget_only = False
-                continue
-            # Drop nodes no tet references (gmsh emits vertices for 0D and 1D
-            # entities too) and renumber, so the solver never sees a zero row
-            # in its stiffness matrix.
-            used = np.zeros(coords.shape[0], bool)
-            used[tets.ravel()] = True
-            ren = np.full(coords.shape[0], -1, np.int64)
-            ren[used] = np.arange(int(used.sum()))
-            surf = surf[(ren[surf] >= 0).all(axis=1)] if surf.size else surf
-            if i == 0:
-                note = ""
-            elif budget_only:
-                # Routine: the part is simply dense at full curvature.
-                note = ("meshed coarser than the default ('%s') to stay inside "
-                        "the element budget -- %s. Normal on a part with many "
-                        "small features." % (label, errs[0] if errs else ""))
-            else:
-                note = ("meshed with the '%s' fallback: the standard settings "
-                        "could not mesh this solid (%s). The stress field is "
-                        "real; treat fine detail near small features with a "
-                        "little caution." % (label, errs[0] if errs else ""))
-            return coords[used], ren[tets], (ren[surf] if surf.size else surf), note
-        raise RuntimeError(
-            "volume meshing failed at every setting. Attempts -- "
-            + " | ".join(errs))
+        coords, tets, surf = _attempt(gmsh, path, target_tets,
+                                      curv, alg3d, minf, tol, heal)
     finally:
         gmsh.finalize()
+
+    # Drop vertices no tet references (gmsh emits nodes for 0D and 1D entities
+    # too) and renumber, so the solver never sees a zero row in its matrix.
+    used = np.zeros(coords.shape[0], bool)
+    used[tets.ravel()] = True
+    ren = np.full(coords.shape[0], -1, np.int64)
+    ren[used] = np.arange(int(used.sum()))
+    surf = surf[(ren[surf] >= 0).all(axis=1)] if surf.size else surf
+    return coords[used], ren[tets], (ren[surf] if surf.size else surf), label
 
 
 def main():
     path, out = sys.argv[1], sys.argv[2]
     target = int(sys.argv[3]) if len(sys.argv) > 3 else 16000
-    nodes, tets, surf, note = build(path, target)
+    strategy = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+    nodes, tets, surf, note = build(path, target, strategy)
     np.savez_compressed(out, nodes=nodes.astype(np.float64),
                         tets=tets.astype(np.int32),
                         surf=surf.astype(np.int32),
