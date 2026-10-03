@@ -70,6 +70,16 @@ SYSTEM_PROMPT = (
     "site or Google Maps. A fluent guess at an address is worse than no "
     "answer, because it reads as checked.\n"
     "- Never invent a source, a URL, or a citation number.\n\n"
+    "\nVENDORS, PLACES AND PRICES\n"
+    "- Name the supplier and link its own site. Give an address, phone "
+    "number or opening hours ONLY if a source states it; otherwise say which "
+    "branch to look up and leave it there.\n"
+    "- Say plainly that branches close and listings go stale, and that the "
+    "vendor's own site or Google Maps is what to check before driving out. "
+    "This is not boilerplate: a San Jose branch this tool once recommended "
+    "had shut permanently.\n"
+    "- Never infer one address from another, and never claim two businesses "
+    "share premises.\n\n"
     "\nHOW TO WRITE IT\n"
     "- Never use a markdown table. Tables do not render in this panel and "
     "arrive as a wall of pipe characters. Compare things in a sentence, or "
@@ -192,6 +202,26 @@ ROUTES = [
      ["motors.vex.com", "docs.wpilib.org", "docs.revrobotics.com",
       "ctr-electronics.com", "vexrobotics.com", "wcproducts.com",
       "sdp-si.com", "gates.com"]),
+    # Where to buy metal, and what it costs. This route did not exist, and its
+    # absence is why "sheet aluminium vendors in San Jose" came back unsourced:
+    # every other route steers Tavily at frcdesign, WPILib and McMaster, so a
+    # supplier's own branch page was never in the allowlist and never survived
+    # scoring. With nothing retrieved the model answered from memory and
+    # invented four addresses on one street.
+    #
+    # The domains are the suppliers' OWN sites on purpose. A branch page is the
+    # one source that is both authoritative about its own address and updated
+    # when that address changes -- which a directory listing is not, as the
+    # permanently-closed San Jose branch showed.
+    ("metal stock and suppliers", [
+        r"\b(vendor|vendors|supplier|suppliers|distributor|stockist|"
+        r"where (?:can|do) i (?:buy|get|find)|buy|purchase|price|prices|"
+        r"cost|quote|in stock|stocked|sheet|plate|bar stock|extrusion|"
+        r"remnant|drop|cut.to.size|will.call)\b"],
+     ["metalsupermarkets.com", "industrialmetalsupply.com", "onlinemetals.com",
+      "mcmaster.com", "alro.com", "speedymetals.com", "midweststeelsupply.com",
+      "discountsteel.com", "sendcutsend.com", "protocase.com", "oshcut.com",
+      "alcobrametals.com", "coastaluminum.com"]),
     ("fasteners and bearings", [
         r"\b(bearing|flanged|thrust|bushing|shoulder ?bolt|rivet|helicoil|"
         r"heli-?coil|thread|tap|10-32|1/4-20|8-32|m3|m5|loctite|nyloc|"
@@ -564,13 +594,30 @@ def search(query, domains=None, depth="advanced", max_results=6, raw=False):
     # file ever reads it. The summarising is done later, once, by the answering
     # model, over the merged pool of every search. Asking for it was paying for
     # four paragraphs per question that were thrown away unread.
-    body = {"api_key": key, "query": query, "search_depth": depth,
+    # Tavily authenticates with an Authorization: Bearer header. The key used
+    # to go in the JSON body as "api_key" and that form has been dropped, so
+    # every search was returning 401 no matter how valid the key was -- and
+    # because the caller turns any exception into "no results", the symptom was
+    # not an error anywhere. It was the assistant quietly answering every
+    # question from training knowledge, for weeks, while reporting that it had
+    # simply found nothing. A swapped key does not fix it; only this does.
+    body = {"query": query, "search_depth": depth,
             "max_results": max_results,
             "include_raw_content": bool(raw)}
     if domains:
         body["include_domains"] = domains
-    r = requests.post(TAVILY_ENDPOINT, json=body, timeout=30)
-    r.raise_for_status()
+    r = requests.post(TAVILY_ENDPOINT, json=body, timeout=30,
+                      headers={"Authorization": "Bearer " + key,
+                               "Content-Type": "application/json"})
+    if r.status_code >= 400:
+        # Surface Tavily's own message. A 401 here means the key; a 432 means
+        # the plan's credits. Both are worth saying out loud rather than
+        # dissolving into an empty result set.
+        try:
+            detail = r.json().get("detail") or r.text[:200]
+        except Exception:
+            detail = r.text[:200]
+        raise RuntimeError("Tavily %s: %s" % (r.status_code, detail))
     return r.json()
 
 
@@ -625,6 +672,14 @@ def _plan_queries(question, topics, domains, analysis=None):
             return
         seen.add(key)
         plan.append({"q": q, "domains": doms, "raw": raw, "n": n, "tag": tag})
+
+    # A question about the world as it is today always gets an unrestricted
+    # open-web search, whatever the router decided. The allowlist is what makes
+    # engineering answers trustworthy and it is exactly what starves a vendor
+    # question, so this is the one case where it gets stepped around rather
+    # than narrowed.
+    if is_perishable(question):
+        add(question, None, False, 8, "open web (live fact)")
 
     aq = list((analysis or {}).get("queries") or [])
     if aq:
@@ -1314,6 +1369,11 @@ def gather(question, topics, domains, analysis=None, timing=None):
                       max_results=step["n"], raw=step["raw"])
 
     _t0 = time.time()
+    # Why every search failed, not just that it did. An empty pool and a pool
+    # that was never filled look identical downstream, and telling them apart
+    # is the difference between "the web had nothing" and "the web was never
+    # asked".
+    search_errors = []
     if plan:
         try:
             from concurrent.futures import ThreadPoolExecutor
@@ -1322,19 +1382,23 @@ def gather(question, topics, domains, analysis=None, timing=None):
                 for i, fut in enumerate(futures):
                     try:
                         results[i] = fut.result()
-                    except Exception:
+                    except Exception as e:
                         results[i] = None
+                        search_errors.append(str(e)[:160])
         except Exception:
             # A machine that cannot start threads at all still gets an answer,
             # just at the old speed. Better slow than sourceless.
             for i, step in enumerate(plan):
                 try:
                     results[i] = _run(step)
-                except Exception:
+                except Exception as e:
                     results[i] = None
+                    search_errors.append(str(e)[:160])
     if timing is not None:
         timing["search"] = int((time.time() - _t0) * 1000)
         timing["searches"] = sum(1 for r in results if r is not None)
+        if search_errors:
+            timing["search_error"] = search_errors[0]
 
     for step, sr in zip(plan, results):
         if sr is None:
@@ -1558,7 +1622,10 @@ def ask_stream(question, model=None):
         if hits:
             plan_meta["search"] = "on" if have_web else "knowledge base only"
         else:
-            plan_meta["search"] = "no results" if have_web else "no TAVILY_API_KEY"
+            plan_meta["search"] = (
+                ("search FAILED - " + timing["search_error"])
+                if timing.get("search_error")
+                else ("no results" if have_web else "no TAVILY_API_KEY"))
         # De-duplicate against anything already listed (the TBA block) BEFORE
         # numbering, never after. Dropping a source once the citation markers
         # have been assigned does not renumber them -- it just makes every [n]
