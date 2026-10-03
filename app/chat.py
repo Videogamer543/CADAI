@@ -586,7 +586,14 @@ class _MarkerStrip:
 
 
 def search(query, domains=None, depth="advanced", max_results=6, raw=False):
-    key = os.environ.get("TAVILY_API_KEY")
+    # Stripped, and quotes removed. A key pasted into envvars.yaml as
+    #     TAVILY_API_KEY: "tvly-abc123"
+    # arrives in the process with the quote marks still attached, and a key
+    # pasted into the Cloud Run console often arrives with a trailing newline
+    # or space. Both produce a 401 that is indistinguishable from a revoked
+    # key, so the obvious next move -- generate a fresh key, paste it the same
+    # way -- reproduces the fault exactly. Cheaper to not care.
+    key = (os.environ.get("TAVILY_API_KEY") or "").strip().strip('"\'')
     if not key:
         raise RuntimeError("TAVILY_API_KEY not set")
     # No include_answer. Tavily's "answer" is its own LLM summary of the
@@ -1397,6 +1404,12 @@ def gather(question, topics, domains, analysis=None, timing=None):
     if timing is not None:
         timing["search"] = int((time.time() - _t0) * 1000)
         timing["searches"] = sum(1 for r in results if r is not None)
+        # How many were ASKED and how many broke, not just the first message.
+        # One query of four failing is a flaky page; four of four failing is
+        # the key, the credits or the endpoint, and the caller can only tell
+        # those apart if it knows the denominator.
+        timing["search_planned"] = len(plan)
+        timing["search_failures"] = len(search_errors)
         if search_errors:
             timing["search_error"] = search_errors[0]
 
@@ -1570,6 +1583,7 @@ def ask_stream(question, model=None):
     timing = {}
     _t_start = time.time()
     chitchat = bool(re.match(_CHITCHAT, question, re.I)) or len(question.strip()) <= 3
+    web_down = False      # set below; declared here so chitchat skips cleanly
     if chitchat:
         an = {"restated": question.strip(), "intent": "", "entities": [],
               "constraints": [], "topics": [], "domains": [], "queries": [],
@@ -1615,17 +1629,47 @@ def ask_stream(question, model=None):
         have_web = bool(os.environ.get("TAVILY_API_KEY"))
         hits, used = gather(question, topics, domains, an, timing=timing)
         n_local = sum(1 for h in hits if h.get("local"))
+        n_web = len(hits) - n_local
         n_full = sum(1 for h in hits if h.get("full_page"))
         plan_meta["queries"] = used
         plan_meta["kb"] = {"hits": n_local}
         plan_meta["full_pages"] = n_full
-        if hits:
-            plan_meta["search"] = "on" if have_web else "knowledge base only"
+
+        # Status is decided by what came back FROM THE WEB, and a search error
+        # is reported whether or not anything else was found.
+        #
+        # The previous version of this block tested `if hits:` and only told
+        # the truth when the list was empty. The list is almost never empty:
+        # gather() consults the local corpus first and unconditionally, so a
+        # question that 401s on every single web query still arrives here with
+        # five knowledge-base passages and reports "search: on". That is how a
+        # broken key stayed invisible through the one change written to expose
+        # it -- the error was recorded, then discarded by the branch above it.
+        # Anything the web half does wrong has to be reportable from the web
+        # half's own counters, not inferred from an emptiness that the corpus
+        # guarantees will not happen.
+        nfail = int(timing.get("search_failures") or 0)
+        nplan = int(timing.get("search_planned") or 0)
+        err = timing.get("search_error") or ""
+        web_down = bool(nplan and nfail >= nplan)
+        if not have_web:
+            state, label = "no_key", "knowledge base only - no TAVILY_API_KEY"
+        elif web_down:
+            state, label = "failed", "search FAILED - " + err
+        elif nfail:
+            state = "partial"
+            label = "partial - %d of %d searches failed: %s" % (nfail, nplan, err)
+        elif n_web:
+            state, label = "ok", "on"
         else:
-            plan_meta["search"] = (
-                ("search FAILED - " + timing["search_error"])
-                if timing.get("search_error")
-                else ("no results" if have_web else "no TAVILY_API_KEY"))
+            state, label = "no_results", "no results"
+        plan_meta["search"] = label
+        # The machine-readable twin of the line above. Two places further down
+        # branched on the exact wording of plan_meta["search"], which means
+        # rewording a sentence meant for a human silently switched off a
+        # footnote -- a bug with no symptom except a missing hint. The prose is
+        # for the reader and may be rewritten freely; this is what code tests.
+        plan_meta["search_state"] = state
         # De-duplicate against anything already listed (the TBA block) BEFORE
         # numbering, never after. Dropping a source once the citation markers
         # have been assigned does not renumber them -- it just makes every [n]
@@ -1660,6 +1704,32 @@ def ask_stream(question, model=None):
             excerpts.append(h["text"])
 
     msgs = []
+    # If the web half is down, SAY SO IN THE ANSWER -- not only in the status
+    # line beside it.
+    #
+    # This is the half of the problem a status field cannot fix. A reader asks
+    # which motors a team ran in 2018, gets four fluent paragraphs of numbers,
+    # and has no way to know those numbers came out of the model rather than
+    # off a page, because an answer written from nothing reads exactly like an
+    # answer written from sources. The citation guard marks the claims uncited,
+    # which is honest and also easy to read as pedantry. The one sentence that
+    # actually protects the reader is the model telling them up front that it
+    # could not check anything -- so the instruction to do that goes in the
+    # prompt, where it governs the text, instead of only in the metadata beside
+    # it, where it governs a pill.
+    if web_down and not chitchat:
+        msgs.append({"role": "system", "content":
+                     "WEB SEARCH IS UNAVAILABLE for this question. Every live "
+                     "search failed (" + (timing.get("search_error") or "") +
+                     "), so you have only the local knowledge base and your "
+                     "own training. Begin your answer with one plain sentence "
+                     "saying you could not check live sources right now, then "
+                     "answer as best you can. Do NOT state specific part "
+                     "numbers, addresses, prices, phone numbers, model years "
+                     "or competition results as fact -- name what you believe "
+                     "and say it needs confirming, or say you do not know. "
+                     "Never describe an unchecked recollection as something "
+                     "you found."})
     # The analysis goes in ahead of the sources so the model reads what was
     # asked before it reads what came back, not the other way round.
     if not chitchat:
@@ -1724,10 +1794,20 @@ def ask_stream(question, model=None):
     n_src = len(sources)
     yield {"type": "plan", "plan": plan_meta, "sources": sources}
 
-    # Nothing retrieved, and the question needs today's world rather than
+    # No LIVE source, and the question needs today's world rather than
     # engineering. Answer honestly instead of letting the model improvise
     # addresses. See PERISHABLE_REFUSAL for what this is preventing.
-    if n_src == 0 and is_perishable(question):
+    #
+    # The test is "no live source", not "no source at all", which is what it
+    # used to be (`n_src == 0`). Those are not the same test and the difference
+    # is the whole failure the user reported: asked for metal suppliers in San
+    # Jose with the web half dead, the corpus still returns pages about plate
+    # stock, n_src is 6, the refusal never fires, and the model writes a
+    # confident list of shops with a street address for a branch that closed.
+    # A knowledge-base passage is not evidence about a shop's opening hours no
+    # matter how relevant it is to aluminium.
+    n_live = sum(1 for s in sources if not s.get("local"))
+    if n_live == 0 and is_perishable(question):
         yield {"type": "delta", "text": PERISHABLE_REFUSAL}
         yield {"type": "done", "result": {
             "answer": PERISHABLE_REFUSAL, "sources": [],
@@ -1776,14 +1856,28 @@ def ask_stream(question, model=None):
     # reported to the reader as an unsupported measurement.
     claimed = answer
 
-    if n_src == 0 and plan_meta.get("search") == "no TAVILY_API_KEY":
+    state = plan_meta.get("search_state")
+    if n_src == 0 and state == "no_key":
         answer += ("\n\n_No sources: add a free Tavily key with SET_API_KEY.bat "
                    "for web search, or build a local knowledge base with "
                    "`python tools/kb_ingest.py seed` - the knowledge base works "
                    "with no key and no internet._")
-    elif plan_meta.get("search") == "knowledge base only" and n_src:
+    elif state == "no_key" and n_src:
         answer += ("\n\n_Answered from the local knowledge base only (no Tavily "
                    "key). Sources are the documents you ingested._")
+    elif state == "failed":
+        # Said in the answer, under the answer, every time. The model was also
+        # told to open with it, but a note the code appends cannot be forgotten
+        # by a model having a fluent day, and this is the one sentence the
+        # reader needs in order to not trust the paragraph above it.
+        answer += ("\n\n_Web search failed for this question (%s), so nothing "
+                   "above was checked against a live source. Treat any "
+                   "address, price, part number or result as unverified._"
+                   % (timing.get("search_error") or "no detail"))
+    elif state == "partial":
+        answer += ("\n\n_Some searches failed (%s); this answer rests on fewer "
+                   "sources than usual._" % (timing.get("search_error")
+                                             or "no detail"))
 
     # Check the numbers against the excerpts they cite. This runs last, on the
     # final text, because everything above can still change it: a stripped [n]
