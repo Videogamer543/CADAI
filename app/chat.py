@@ -653,6 +653,133 @@ def tba_team(num, year=None):
     return out
 
 
+# The game each season was played under. Not here to be recited -- here so the
+# answering model can be told that a name it is looking at belongs to the
+# SEASON and not to the robot.
+#
+# This exists because of a specific wrong answer. Asked for team 1678's 2026
+# robot, the assistant replied "REBUILT(tm)", which is the 2026 FRC game. Every
+# official page for a team's season carries the game's branding in its header,
+# so a model reading an frc-events page sees one capitalised trademarked name
+# next to the team number and reasonably concludes it is the robot. It is not:
+# 1678's 2026 robot is Limestone, and the game is what all 3000-odd teams
+# played. A robot name only ever comes from the team itself -- their reveal
+# video, their robot page, their Chief Delphi post.
+#
+# An entry being wrong or missing costs nothing: the warning simply does not
+# fire for that year. It can never fabricate a robot name.
+FRC_GAMES = {
+    2026: "REBUILT", 2025: "REEFSCAPE", 2024: "CRESCENDO", 2023: "CHARGED UP",
+    2022: "RAPID REACT", 2021: "INFINITE RECHARGE", 2020: "INFINITE RECHARGE",
+    2019: "DESTINATION: DEEP SPACE", 2018: "FIRST POWER UP",
+    2017: "FIRST STEAMWORKS", 2016: "FIRST STRONGHOLD", 2015: "RECYCLE RUSH",
+    2014: "AERIAL ASSIST", 2013: "ULTIMATE ASCENT", 2012: "REBOUND RUMBLE",
+    2011: "LOGO MOTION", 2010: "BREAKAWAY", 2009: "LUNACY",
+    2008: "FIRST OVERDRIVE",
+}
+
+
+def _wlt(rec):
+    """(wins, losses, ties) out of a TBA record dict, missing parts as zero."""
+    rec = rec or {}
+    return (int(rec.get("wins") or 0), int(rec.get("losses") or 0),
+            int(rec.get("ties") or 0))
+
+
+def tba_season(num, year):
+    """What a team actually DID in one season: events, record, awards.
+
+    This is the half that was missing, and the reason answers about a team's
+    year read like reminiscence instead of record. The old block handed the
+    model `str(info)[:800]` -- a Python dict repr of the team's name, city and
+    rookie year, identical for every season the team has ever had. Asked what
+    254 did in 2018 it therefore had nothing to say about 2018 and said
+    something plausible instead.
+
+    The facts people actually want from a team-and-year question are match
+    record, which events they won and what awards they took, and all three are
+    one API call each and unambiguous. "Went undefeated" is not a judgement
+    call when you are holding 0 in the losses column.
+
+    Returns a dict, or raises -- the caller treats any failure as "no TBA".
+    """
+    year = int(year)
+    events = _tba_get(f"/team/frc{num}/events/{year}/simple")
+    by_key = {e["key"]: e for e in events}
+    try:
+        statuses = _tba_get(f"/team/frc{num}/events/{year}/statuses") or {}
+    except Exception:
+        statuses = {}
+    try:
+        awards = _tba_get(f"/team/frc{num}/awards/{year}") or []
+    except Exception:
+        awards = []
+
+    rows, tot = [], [0, 0, 0]
+    for key, ev in sorted(by_key.items(), key=lambda kv: kv[1].get("start_date") or ""):
+        st = statuses.get(key) or {}
+        qual = ((st.get("qual") or {}).get("ranking") or {})
+        qw, ql, qt = _wlt(qual.get("record"))
+        pw, pl, pt = _wlt((st.get("playoff") or {}).get("record"))
+        tot[0] += qw + pw
+        tot[1] += ql + pl
+        tot[2] += qt + pt
+        bits = ["%s (%s)" % (ev.get("name") or key, key)]
+        if qual.get("rank"):
+            bits.append("qualified rank %s" % qual["rank"])
+        if qw or ql or qt:
+            bits.append("quals %d-%d-%d" % (qw, ql, qt))
+        if pw or pl or pt:
+            bits.append("playoffs %d-%d-%d" % (pw, pl, pt))
+        # TBA's own words for how the event ended ("Won the event", "Eliminated
+        # in the semifinals"), with its markup stripped.
+        fin = re.sub(r"<[^>]+>", "", str((st.get("playoff") or {}).get("status")
+                                         or st.get("overall_status_str") or ""))
+        if fin:
+            bits.append(fin.strip())
+        evn = [a.get("name") for a in awards if a.get("event_key") == key]
+        if evn:
+            bits.append("awards: " + ", ".join(evn))
+        rows.append(" - ".join(bits))
+
+    w, l, t = tot
+    return {
+        "year": year,
+        "events": rows,
+        "record": (w, l, t),
+        "undefeated": bool(w and not l),
+        "awards": [a.get("name") for a in awards],
+        "n_events": len(rows),
+    }
+
+
+def tba_season_block(num, year, info=None):
+    """The season as text a model can quote, not a dict repr."""
+    s = tba_season(num, year)
+    w, l, t = s["record"]
+    out = ["Team %s, %s season - from The Blue Alliance (official match data):"
+           % (num, year)]
+    game = FRC_GAMES.get(int(year))
+    if game:
+        out.append("The %s game was %s. That is the GAME every team played "
+                   "that season, NOT this team's robot name." % (year, game))
+    if s["n_events"]:
+        out.append("Match record across %d event(s): %d-%d-%d (win-loss-tie)."
+                   % (s["n_events"], w, l, t))
+        if s["undefeated"]:
+            out.append("They lost no matches that season - %d wins, 0 losses. "
+                       "This is a complete record from official match results, "
+                       "so it is safe to say so plainly." % w)
+    for r in s["events"]:
+        out.append("  * " + r)
+    if s["awards"]:
+        out.append("Awards in %s: %s" % (year, "; ".join(s["awards"])))
+    if info and info.get("website"):
+        out.append("The team's own site is %s - their robot page there is the "
+                   "authority on what the robot was called." % info["website"])
+    return "\n".join(out), s
+
+
 _CHITCHAT = r"^\s*(hi|hey|hello|yo|thanks|thank you|ty|ok|okay|cool|nice|sup|" \
             r"good (morning|afternoon|evening)|how are you)\b[\s!.?]*$"
 
@@ -660,7 +787,7 @@ _CHITCHAT = r"^\s*(hi|hey|hello|yo|thanks|thank you|ty|ok|okay|cool|nice|sup|" \
 MAX_SEARCHES = 4
 
 
-def _plan_queries(question, topics, domains, analysis=None):
+def _plan_queries(question, topics, domains, analysis=None, must_sites=None):
     """Complementary searches derived from what the question actually asks.
 
     When the analysis pass produced queries, the first one (the planner is told
@@ -685,6 +812,13 @@ def _plan_queries(question, topics, domains, analysis=None):
     # engineering answers trustworthy and it is exactly what starves a vendor
     # question, so this is the one case where it gets stepped around rather
     # than narrowed.
+    # A site that OWNS the answer gets a search to itself, ahead of everything.
+    # Folded into the general allowlist it competes with a dozen forum domains
+    # for six result slots and usually loses, which is how a team's own robot
+    # page stayed unread while four Chief Delphi threads about it came back.
+    for s in (must_sites or []):
+        add(question, [s], True, 5, "team's own site")
+
     if is_perishable(question):
         add(question, None, False, 8, "open web (live fact)")
 
@@ -1303,7 +1437,8 @@ def _deepen(pool, terms, specific):
                         + 1.5 * rel + bias)
 
 
-def gather(question, topics, domains, analysis=None, timing=None):
+def gather(question, topics, domains, analysis=None, timing=None,
+           must_sites=None):
     """Run the plan, merge, de-duplicate, type and rank.
 
     Four things decide a result's place: how well Tavily matched it, whether it
@@ -1352,7 +1487,7 @@ def gather(question, topics, domains, analysis=None, timing=None):
         pool.sort(key=lambda r: -r["score"])
         return pool[:keep], used_queries
 
-    plan = _plan_queries(question, topics, domains, analysis)
+    plan = _plan_queries(question, topics, domains, analysis, must_sites)
 
     # All of the plan's searches at once, not one after another.
     #
@@ -1606,11 +1741,54 @@ def ask_stream(question, model=None):
 
     # FRC team lookups still go straight to The Blue Alliance
     tm = re.search(r"\b(?:team|frc)\s*#?(\d{1,5})\b", question, re.I)
+    # A season, if the question names one. Any four-digit number from 1992 (the
+    # first FRC season) to next year that is not the team number just matched.
+    # Searched over the whole question rather than near the team number because
+    # "254 2018 robot", "1678's robot in 2026" and "what did 1678 do in 2026"
+    # all put it somewhere different.
+    season = None
+    if tm:
+        _now = datetime.datetime.now().year
+        for m in re.finditer(r"\b(\d{4})\b", question):
+            if m.span() == tm.span(1):
+                continue
+            y = int(m.group(1))
+            if 1992 <= y <= _now + 1:
+                season = y
+                break
+    team_site = None
     if tm:
         try:
             t = tba_team(tm.group(1))
-            info = str(t["info"])[:800]
+            raw = t.get("info") or {}
+            # Readable sentences, not a dict repr. The repr was being handed
+            # both to the model AND to the grounding check as the excerpt for
+            # this source, so every number inside it -- rookie year, postal
+            # code -- counted as "supported by source 1".
+            info = ("Team %s is %s (%s), from %s, %s, %s. Rookie year %s."
+                    % (raw.get("team_number"), raw.get("nickname") or "?",
+                       raw.get("name") or "?", raw.get("city") or "?",
+                       raw.get("state_prov") or "?", raw.get("country") or "?",
+                       raw.get("rookie_year") or "?"))
+            if raw.get("website"):
+                team_site = _host(raw["website"]) or None
+            blocks = [info]
+            if season:
+                # The season facts, when the question named one. Kept separate
+                # from the identity line so a failure here -- a team that did
+                # not compete that year, a TBA hiccup -- still leaves the
+                # identity available rather than losing both.
+                try:
+                    txt, _s = tba_season_block(tm.group(1), season, raw)
+                    blocks.append(txt)
+                except Exception:
+                    pass
+            info = "\n".join(blocks)
             for srec in t.get("sources", []):
+                if season and "thebluealliance.com/team/" in (srec.get("url") or ""):
+                    srec = dict(srec)
+                    srec["url"] = srec["url"].rstrip("/") + "/%d" % season
+                    srec["title"] = "%s (%s season)" % (srec["title"], season)
                 sources.append(srec)
                 # `excerpts` shadows `sources` one-for-one so the grounding
                 # check can ask "what did source 3 actually say". It cannot use
@@ -1622,12 +1800,24 @@ def ask_stream(question, model=None):
         except Exception:
             pass
 
+    # Search the team's OWN site, with the full page, not just a snippet.
+    #
+    # The 1678 answer cited citruscircuits.org/2026-robot in its own text and
+    # never read it -- the page naming the robot and listing every mechanism
+    # was one fetch away and the answer was assembled from forum threads
+    # instead. A team's site is the authority on its own robot, so when the
+    # question is about a specific team it goes to the front of the allowlist.
+    if team_site and team_site not in domains:
+        domains = [team_site] + list(domains)
+        plan_meta["domains"] = domains
+
     # Search every real question. The old keyword gate silently skipped most of
     # them, which is the direct cause of un-sourced answers.
     if not chitchat:
         yield {"type": "stage", "stage": "search"}
         have_web = bool(os.environ.get("TAVILY_API_KEY"))
-        hits, used = gather(question, topics, domains, an, timing=timing)
+        hits, used = gather(question, topics, domains, an, timing=timing,
+                            must_sites=([team_site] if team_site else None))
         n_local = sum(1 for h in hits if h.get("local"))
         n_web = len(hits) - n_local
         n_full = sum(1 for h in hits if h.get("full_page"))
@@ -1775,6 +1965,35 @@ def ask_stream(question, model=None):
                 "If your engineering knowledge covers a member none of the "
                 "sources name, include it too and mark it as not from the "
                 "sources rather than leaving it out.")
+        if tm and season:
+            game = FRC_GAMES.get(season)
+            rule = ["This question is about ONE team in ONE season (team %s, %s)."
+                    % (tm.group(1), season)]
+            if game:
+                # Repeated here because the TBA block that also says this only
+                # exists when TBA_API_KEY is set, and the mistake it prevents
+                # does not wait for a key.
+                rule.append(
+                    "The %d FRC game was %s. %s is the GAME, played by every "
+                    "team that season. It is NOT the name of this team's "
+                    "robot. Do not present it as one." % (season, game, game))
+            rule.append(
+                "A robot's name comes only from the team themselves - their "
+                "robot page, reveal video or build thread. If no source names "
+                "the robot, say it is not named in what you found rather than "
+                "offering the game, the season or the team's own name.")
+            # The second half of the complaint this answers. The 254 reply was
+            # correct and thin: it named two documents and stopped, leaving out
+            # that the team went undefeated that year -- the thing anyone
+            # asking about 254 in 2018 actually wants to know.
+            rule.append(
+                "Lead with what the team actually DID that season - match "
+                "record, events won, awards, anything notable about how the "
+                "season went - and then the robot's mechanisms. Give the "
+                "concrete results the sources support instead of pointing at "
+                "documents the reader can go and read; say where to look only "
+                "for what the sources do not cover.")
+            lines.append(" ".join(rule))
         lines.append("Answer this exact question first, then support it.")
         msgs.append({"role": "system", "content": "\n".join(lines)})
     if context_blocks:
