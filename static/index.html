@@ -112,6 +112,16 @@
     background:var(--raise);color:var(--txt);font-size:.7rem;font-weight:600;cursor:pointer}
   .ctxbtn:hover{border-color:var(--edge);background:#242424}
   .ctxbtn:disabled{opacity:.55;cursor:default}
+  /* The pick mode is the one control whose state you have to be able to read
+     without looking for it -- the consequence of forgetting it is on is that
+     your next click on the part changes the boundary conditions. Hence a lit
+     border and a tinted background on the active one, not a subtle shade. */
+  .pkMode{flex:1;padding:6px 4px;border:1px solid var(--line2);border-radius:6px;
+    background:var(--raise);color:var(--txt);font-size:.66rem;font-weight:600;cursor:pointer}
+  .pkMode:hover{border-color:var(--edge)}
+  .pkMode.on[data-m="fixed"]{border-color:#7dd3fc;color:#7dd3fc;background:#0e1b22}
+  .pkMode.on[data-m="load"]{border-color:#ffd166;color:#ffd166;background:#201c0d}
+  .pkMode.on[data-m="off"]{border-color:var(--edge);background:#242424}
   #ctxOut{font-size:.63rem;line-height:1.5;color:var(--dim);margin-top:6px}
   #ctxOut .hit{color:var(--hi);font-weight:600}#ctxOut .guess{color:var(--dim2)}
   /* stress-map overlays: the key in the corner and the hover readout */
@@ -256,12 +266,31 @@
       <option value="ss_center">Simply supported — center</option>
       <option value="ss_dist">Simply supported — distributed</option>
       <option value="fixed_fixed">Fixed–fixed</option>
+      <option value="axial">Axial — straight pull or push</option>
+      <option value="bending">Pure bending — end moment</option>
+      <option value="torque">Torque — twisted through the hub</option>
     </select>
+    <!-- Pure bending is NOT the cantilever case under another name, which is
+         why it earns its own entry. A tip load puts a moment on the root that
+         falls off along the span and drags shear with it; an end couple puts
+         the same moment everywhere and no shear at all. Measured on a
+         300x50 mm bar: pure bending reads 22.80 MPa at four stations along the
+         span; the cantilever reads 38.0, 29.3, 20.9, 12.5.
+
+         Torque is a couple about the plate's normal, applied where a torque
+         actually enters a plate -- around the largest bore. All three are
+         honest plane stress. Twisting a plate about its own long axis, or
+         bending it out of its plane, are NOT: those need a plate or shell
+         element and a different solver, and this app does not claim them. -->
 
     <div class="row">
       <div><label>Span axis</label>
         <select id="orientation" title="The part's LONG direction in the image — not the direction the force points. The load is applied across this axis automatically."><option value="horizontal">Horizontal ↔</option><option value="vertical">Vertical ↕</option></select></div>
-      <div><label>Load (N)</label><input type="number" id="load" value="500" step="10"></div>
+      <!-- The unit follows the case. A couple is measured in newton-metres
+           and a force in newtons, and 200 of one is nothing like 200 of the
+           other -- they differ by the span. Relabelling is the cheapest way
+           to stop someone typing a force into a moment. -->
+      <div><label id="loadLbl">Load (N)</label><input type="number" id="load" value="500" step="10"></div>
     </div>
     <!-- This said "Load axis" until it caused a real misdiagnosis. Everyone,
          including the person who wrote the label, reads that as "which way does
@@ -278,6 +307,32 @@
     <div style="font-size:.62rem;color:#737373;margin:-4px 0 8px;line-height:1.45">
       The part's <b>long</b> direction — not the way the force points. The load
       is always applied across it.</div>
+    <!-- Point at it. Do not describe it.
+         The dropdown above can only say "one end is held, the other is
+         loaded", which is right for a beam and wrong for almost every real
+         bracket -- and on a part with thirty holes no sentence identifies
+         which one is bolted down.
+
+         This is a mode, not an annotation tool. Pick "Supported" or "Bears
+         load", then click the part: each click puts that condition there and
+         nothing else is asked. Direction and magnitude come from the load
+         case and the load box that are already on this panel, and the total
+         is split between however many load points there are, so two clicks
+         at 500 N is 250 N each. Click a marker again to remove it. -->
+    <label>Click the part to place</label>
+    <div id="pickModes" style="display:flex;gap:5px">
+      <button class="pkMode on" data-m="off"  onclick="setPickMode('off')">Off</button>
+      <button class="pkMode"    data-m="fixed" onclick="setPickMode('fixed')">Supported</button>
+      <button class="pkMode"    data-m="load"  onclick="setPickMode('load')">Bears load</button>
+    </div>
+    <div id="pickHint" style="font-size:.62rem;color:#737373;margin:5px 0 0;line-height:1.45">
+      Works on the stress map, the pocketing view and the 3D solid. Anything
+      placed here is used instead of the load case above.
+    </div>
+    <div id="pickList" style="margin-top:7px"></div>
+    <button id="pickClear" class="ctxbtn" style="display:none;margin-top:6px"
+            onclick="clearPicks()">Clear all</button>
+
     <label>Thickness (mm)<span style="color:#737373;font-weight:400"> — measured from STEP files</span></label>
     <input type="number" id="thick" value="6.35" step="0.25" min="0.3">
     <div id="thickNote" style="font-size:.62rem;color:#737373;margin-top:3px;line-height:1.4"></div>
@@ -409,6 +464,7 @@
         </div>
       </div>
       <canvas id="cv" width="900" height="600"></canvas>
+
       <!-- The plan view is a canvas, not the raw PNG: the labels have to stay
            legible at any zoom, and a baked-in 10 px font does not. -->
       <canvas id="cvp" width="900" height="600"></canvas>
@@ -974,6 +1030,10 @@ function render3d(){
     // the second path per facet is the difference between smooth and not.
     if(!v3.drag){ctx.strokeStyle=col;ctx.lineWidth=0.6;ctx.stroke();}}
 
+  // Placed supports and loads, through the same projection as the facets so
+  // they stay on the surface as it turns.
+  if(typeof drawPicks3d==='function') drawPicks3d(ctx,rot,q=>[q[0]*sc+ox,-q[1]*sc+oy]);
+
   _proj3d=[];
   if(solid3d&&solid3d.callouts){
     // Depth-sorted, and the ones round the back are dimmed: a marker floating
@@ -1001,12 +1061,21 @@ function render3d(){
     : mesh3d.n_tris.toLocaleString()+' triangles',14,36);
 }
 (function(){const cv=$('cv3d');
-  cv.addEventListener('mousedown',e=>{v3.drag=true;v3.mode=(e.button===2||e.shiftKey)?'pan':'rot';v3.lx=e.clientX;v3.ly=e.clientY;cv.style.cursor=v3.mode==='pan'?'move':'grabbing';});
+  // `moved` separates a click from an orbit. Without it, letting go after
+  // spinning the part counts as a click and drops a support wherever the
+  // cursor happened to land -- which is maddening, because the part is in a
+  // new position by then and the marker looks like it came from nowhere.
+  cv.addEventListener('mousedown',e=>{v3.drag=true;v3.moved=false;v3.dragged=false;v3.mode=(e.button===2||e.shiftKey)?'pan':'rot';v3.lx=e.clientX;v3.ly=e.clientY;v3.dx0=e.clientX;v3.dy0=e.clientY;cv.style.cursor=v3.mode==='pan'?'move':'grabbing';});
   cv.addEventListener('contextmenu',e=>e.preventDefault());
   // Repaint on release: the drag was drawn at reduced detail, so without this
   // the part would sit there at half resolution until something else moved.
-  window.addEventListener('mouseup',()=>{const was=v3.drag;v3.drag=false;
-    cv.style.cursor='grab'; if(was&&view==='3d')render3d();});
+  window.addEventListener('mouseup',e=>{const was=v3.drag;v3.drag=false;
+    // 4 px of slop: a deliberate click never moves further than that, and a
+    // deliberate orbit always moves more.
+    v3.dragged = was && (Math.abs(e.clientX-(v3.dx0||0))>4 ||
+                         Math.abs(e.clientY-(v3.dy0||0))>4);
+    cv.style.cursor=(typeof pickMode!=='undefined'&&pickMode!=='off')?'crosshair':'grab';
+    if(was&&view==='3d')render3d();});
   window.addEventListener('mousemove',e=>{if(!v3.drag||view!=='3d')return;const dx=e.clientX-v3.lx,dy=e.clientY-v3.ly;
     if(v3.mode==='pan'){v3.panX+=dx;v3.panY+=dy;}else{v3.ry+=dx*0.01;v3.rx+=dy*0.01;}v3.lx=e.clientX;v3.ly=e.clientY;render3d();});
   cv.addEventListener('wheel',e=>{if(view!=='3d')return;e.preventDefault();v3.zoom=Math.max(0.3,Math.min(4,v3.zoom*(e.deltaY<0?1.1:0.9)));render3d();},{passive:false});
@@ -1054,6 +1123,7 @@ async function analyze3d(){
   fd.append('load',$('load').value);
   fd.append('thickness_mm_in',$('thick').value||0);
   fd.append('load_context',$('loadCtx').value);
+  if(PICKS3D.length) fd.append('picks', JSON.stringify(picks3dForPost()));
   try{
     const r=await fetch('/api/analyze3d',{method:'POST',body:fd});
     if(!r.ok){showError(await r.text(), r.status, r.statusText);return}
@@ -1108,6 +1178,10 @@ async function analyze(){
   // The text goes to the server too: whatever it states beats the dropdowns,
   // so running without pressing "Read this" first still honours what you wrote.
   fd.append('load_context',$('loadCtx').value);
+  // Only the fields the solver needs. `dir` and `label` are the browser's own
+  // bookkeeping for redrawing and for the list, and sending them would invite
+  // someone to start believing them on the server.
+  if(PICKS.length) fd.append('picks', JSON.stringify(picksForPost()));
   try{
     const r=await fetch('/api/analyze',{method:'POST',body:fd});
     if(!r.ok){showError(await r.text(), r.status, r.statusText);return}
@@ -1662,6 +1736,11 @@ function render(d){
   // Last, so supports and load arrows sit over the badges rather than under
   // them: they are the frame the rest of the picture has to be read inside.
   if($('showBC').checked) drawBC(ctx,d.bc,s);
+  // After drawBC on purpose. drawBC draws what the solve ACTUALLY used; these
+  // are what was asked for. Drawn on top, a pick that caught no edge sits
+  // visibly alone with no support hatching under it, instead of being
+  // indistinguishable from one that worked.
+  drawPicks(ctx,s);
   drawMapKey(d);
 }
 
@@ -1698,7 +1777,312 @@ function shapeLine(d,lead){
 const CASE_TEXT={cantilever:'Cantilever — fixed one end, load at free end',
   ss_center:'Simply supported — load at centre',
   ss_dist:'Simply supported — distributed load',
-  fixed_fixed:'Fixed–fixed — both ends clamped'};
+  fixed_fixed:'Fixed–fixed — both ends clamped',
+  axial:'Axial — straight pull along the span',
+  bending:'Pure bending — equal moment along the whole span, no shear',
+  torque:'Torque — a couple about the plate, put in at the hub'};
+
+/* ------------------------------------------------------------------ picks
+   Where the part is held and where the load goes, placed by clicking it.
+
+   This is a MODE, not an annotation layer. Pick "Supported" or "Bears load",
+   then click: that is the whole interaction. No popup, no per-point form, no
+   direction to choose before anything happens. Direction comes from the load
+   case and magnitude from the load box, both of which are already on screen,
+   and the total is divided between however many load points were placed --
+   so two clicks at 500 N is 250 N each, because the number in the box says
+   what the part carries, not what each finger does.
+
+   Three views share one list. The 2D stress map and the pocketing plan are
+   the same pixel space, so a point placed on one shows on the other. The 3D
+   solid keeps its own list in millimetres, because a point on a solid has a
+   third coordinate and the flat views have no opinion about it.            */
+let PICKS = [], PICKS3D = [], pickMode = 'off';
+const LOAD_UNIT = {bending: 'N·m', torque: 'N·m'};
+
+function loadUnitLabel(){
+  const u = LOAD_UNIT[$('loadCase').value] || 'N';
+  $('loadLbl').textContent = (u === 'N·m' ? 'Moment (N·m)' : 'Load (N)');
+}
+
+function setPickMode(m){
+  pickMode = m;
+  for(const b of document.querySelectorAll('.pkMode'))
+    b.classList.toggle('on', b.dataset.m === m);
+  const cur = (m === 'off') ? '' : 'crosshair';
+  $('cv').style.cursor = cur;
+  $('cvp').style.cursor = cur;
+  // The 3D canvas already owns its cursor for orbiting, and taking that away
+  // while picking is on would hide the fact that you can still rotate.
+  $('cv3d').style.cursor = (m === 'off') ? 'grab' : 'crosshair';
+  renderPickList();
+}
+
+/* ---- the flat views ---------------------------------------------------- */
+
+/* Canvas pixels to part pixels. render() sizes the canvas to image_size, so
+   this is one ratio and no transform stack -- and it is the same ratio for
+   the pocketing canvas, which is drawn in the same frame. */
+/* The stress canvas is sized to image_size; the pocketing canvas is sized to
+   the silhouette PNG, which is not always the same number of pixels. One
+   ratio reconciles them, so a point placed on either view lands in the same
+   part coordinates -- which is what makes the two views share a list. */
+function flatScale(cv){
+  if(!lastData || !lastData.image_size) return 1;
+  const w = lastData.image_size[0] || 1;
+  return (cv.width || w) / w;
+}
+
+function partXY(cv, e){
+  const b = cv.getBoundingClientRect();
+  if(!b.width || !b.height) return null;
+  const k = flatScale(cv) || 1;
+  return [(e.clientX - b.left) * cv.width / b.width / k,
+          (e.clientY - b.top) * cv.height / b.height / k];
+}
+
+/* Snap to the feature under the cursor. A click inside a bore means the bore;
+   anything else means the nearest piece of outline. Snapping matters more
+   than it looks: a condition has to sit ON a boundary to be carried by any
+   facet, and a click two pixels into open material belongs to none. */
+function snapTo(d, x, y){
+  let best = null, bd = 1e9;
+  for(const h of (d.hole_stress || [])){
+    const dist = Math.hypot(x - h.x, y - h.y);
+    if(dist <= h.r * 1.7 && dist < bd){
+      bd = dist;
+      best = {x: h.x, y: h.y, r: Math.max(h.r * 1.25, 4),
+              label: 'bore ⌀' + (2 * h.r / (d.px_per_mm || 1)).toFixed(1) + ' mm'};
+    }
+  }
+  if(best) return best;
+  const n = d.nodes || [];
+  let bi = -1; bd = 1e9;
+  for(const loop of (boundaryLoops(d) || []))
+    for(const i of loop){
+      const dist = Math.hypot(x - n[i][0], y - n[i][1]);
+      if(dist < bd){bd = dist; bi = i}
+    }
+  const sz = Math.min(d.image_size[0], d.image_size[1]);
+  if(bi < 0 || bd > sz * 0.09) return null;
+  // An edge has no natural radius the way a bore does, so it takes a patch of
+  // outline scaled to the part: wide enough to catch several facets on a
+  // coarse mesh, narrow enough not to swallow a whole side.
+  return {x: n[bi][0], y: n[bi][1], r: Math.max(sz * 0.05, 6), label: 'edge'};
+}
+
+function flatClick(cv, e){
+  if(pickMode === 'off' || !lastData) return;
+  const xy = partXY(cv, e); if(!xy) return;
+  // A click on something already placed removes it. One gesture, both ways --
+  // nothing to select first and no delete button to find.
+  for(let i = 0; i < PICKS.length; i++){
+    if(Math.hypot(xy[0] - PICKS[i].x, xy[1] - PICKS[i].y) <= PICKS[i].r * 1.2){
+      PICKS.splice(i, 1); afterPickChange(); return;
+    }
+  }
+  const f = snapTo(lastData, xy[0], xy[1]);
+  if(!f){
+    setStatusHint('Click on the part — a hole or an edge. Nothing there.');
+    return;
+  }
+  PICKS.push({role: pickMode, x: f.x, y: f.y, r: f.r, label: f.label});
+  afterPickChange();
+}
+
+/* ---- the 3D view ------------------------------------------------------- */
+
+/* Which facet is under the cursor. The viewer's own projection, run again on
+   the click: rotate every triangle, keep the ones whose screen footprint
+   contains the point, and take the nearest to the camera.
+
+   Nearest, not first: the facets are drawn back-to-front, so without the
+   depth test a click on the front of a part would land on the back of it --
+   and on a plate the two are a few millimetres apart and the wrong one is
+   the far face of the same hole. */
+function pick3dAt(e){
+  const src = solid3d || mesh3d; if(!src) return null;
+  const cv = $('cv3d'), b = cv.getBoundingClientRect();
+  const mx = (e.clientX - b.left) * cv.width / b.width;
+  const my = (e.clientY - b.top) * cv.height / b.height;
+  const W = cv.width, H = cv.height;
+  const verts = src.verts || null, tris = src.tris, ctr = src.ctr, span = src.span;
+  const crx = Math.cos(v3.rx), srx = Math.sin(v3.rx),
+        cry = Math.cos(v3.ry), sry = Math.sin(v3.ry);
+  const rot = p => {
+    const dx = (p[0]-ctr[0])/span, dy = (p[1]-ctr[1])/span, dz = (p[2]-ctr[2])/span;
+    const x1 = dx*cry + dz*sry, z1 = -dx*sry + dz*cry;
+    return [x1, dy*crx - z1*srx, dy*srx + z1*crx];
+  };
+  const sc = Math.min(W, H) * 0.7 * v3.zoom, ox = W/2 + v3.panX, oy = H/2 + v3.panY;
+  const S = q => [q[0]*sc + ox, -q[1]*sc + oy];
+  let best = null, bz = -1e9;
+  for(const t of tris){
+    const P = verts ? [verts[t[0]], verts[t[1]], verts[t[2]]] : t;
+    const r0 = rot(P[0]), r1 = rot(P[1]), r2 = rot(P[2]);
+    const a = S(r0), c = S(r1), g = S(r2);
+    // Barycentric sign test. Cheap, and exact on the edges either way -- a
+    // click on a shared edge picks one of the two facets and both have the
+    // same centroid to within a facet, which is well inside the capture
+    // radius the pick is given.
+    const d1 = (mx-c[0])*(a[1]-c[1]) - (a[0]-c[0])*(my-c[1]);
+    const d2 = (mx-g[0])*(c[1]-g[1]) - (c[0]-g[0])*(my-g[1]);
+    const d3 = (mx-a[0])*(g[1]-a[1]) - (g[0]-a[0])*(my-a[1]);
+    const neg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+    const pos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+    if(neg && pos) continue;
+    const z = (r0[2] + r1[2] + r2[2]) / 3;
+    if(z > bz){
+      bz = z;
+      best = [(P[0][0]+P[1][0]+P[2][0])/3, (P[0][1]+P[1][1]+P[2][1])/3,
+              (P[0][2]+P[1][2]+P[2][2])/3];
+    }
+  }
+  return best;
+}
+
+function solidClick(e){
+  if(pickMode === 'off' || v3.dragged) return;
+  const src = solid3d || mesh3d; if(!src) return;
+  const p = pick3dAt(e);
+  if(!p){setStatusHint('Click on the solid itself.'); return}
+  // One capture radius for every pick, scaled to the part. A sphere on a
+  // tessellated surface is a blunt instrument, and sizing it per click would
+  // mean guessing at a feature the viewer cannot see -- the solver holds a
+  // different mesh from the one on screen.
+  const r = src.span * 0.06;
+  for(let i = 0; i < PICKS3D.length; i++){
+    const q = PICKS3D[i];
+    if(Math.hypot(p[0]-q.x, p[1]-q.y, p[2]-q.z) <= q.r){
+      PICKS3D.splice(i, 1); afterPickChange(); return;
+    }
+  }
+  PICKS3D.push({role: pickMode, x: p[0], y: p[1], z: p[2], r: r});
+  afterPickChange();
+}
+
+/* ---- shared ------------------------------------------------------------ */
+
+function clearPicks(){PICKS = []; PICKS3D = []; afterPickChange()}
+
+function setStatusHint(msg){
+  const el = $('pickHint'); if(!el) return;
+  el.textContent = msg;
+  clearTimeout(setStatusHint._t);
+  setStatusHint._t = setTimeout(renderPickList, 2600);
+}
+
+function afterPickChange(){
+  renderPickList();
+  if(view === '3d') render3d();
+  else if(lastData) render(lastData);
+}
+
+function renderPickList(){
+  const hint = $('pickHint');
+  if(hint) hint.textContent =
+    'Works on the stress map, the pocketing view and the 3D solid. Anything '
+    + 'placed here is used instead of the load case above.';
+  const el = $('pickList'); if(!el) return;
+  const n = PICKS.length + PICKS3D.length;
+  $('pickClear').style.display = n ? '' : 'none';
+  if(!n){
+    el.innerHTML = '<span style="font-size:.62rem;color:#737373">'
+      + 'Nothing placed — the load case above is being used.</span>';
+    return;
+  }
+  const held = PICKS.filter(p => p.role === 'fixed').length
+             + PICKS3D.filter(p => p.role === 'fixed').length;
+  const loaded = n - held;
+  const each = loaded ? (parseFloat($('load').value) || 0) / loaded : 0;
+  const bits = [];
+  if(held) bits.push(held + ' point' + (held > 1 ? 's' : '') + ' held');
+  if(loaded) bits.push(loaded + ' loaded, ' + each.toFixed(0) + ' '
+                       + (LOAD_UNIT[$('loadCase').value] || 'N') + ' each');
+  el.innerHTML = '<div style="font-size:.64rem;color:#a3a3a3">'
+    + esc(bits.join(' · ')) + '</div>'
+    + (loaded && !held ? '<div style="font-size:.6rem;color:#e5a0a0;'
+        + 'margin-top:4px">Nothing is holding the part — add a support, or '
+        + 'the load case\'s own support is used.</div>' : '');
+}
+
+/* Markers, in the two colours the solver's own supports and arrows already
+   use, so a placed support reads as a support rather than as a third kind of
+   annotation. Drawn AFTER drawBC on the flat views: drawBC shows what the
+   solve actually used, so a point that caught no facet sits visibly alone
+   instead of looking like one that worked. */
+function drawPicks(ctx, s, k){
+  k = k || 1;
+  for(const p of PICKS)
+    pickGlyph(ctx, p.x * k, p.y * k, p.r * k, p.role, s);
+}
+
+function pickGlyph(ctx, x, y, r, role, s){
+  const held = role === 'fixed';
+  ctx.save();
+  ctx.lineWidth = Math.max(1.5, 2 * s);
+  ctx.strokeStyle = held ? '#7dd3fc' : '#ffd166';
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 6.2832); ctx.stroke();
+  if(held){
+    for(let k = -2; k <= 2; k++){
+      const a = x + k * r * 0.45, b = y + r;
+      ctx.beginPath(); ctx.moveTo(a, b); ctx.lineTo(a - 5 * s, b + 6 * s); ctx.stroke();
+    }
+  }else{
+    ctx.beginPath(); ctx.moveTo(x, y - r * 1.9); ctx.lineTo(x, y + r * 0.4); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x, y + r * 0.5);
+    ctx.lineTo(x - 4.5 * s, y + r * 0.5 - 7 * s);
+    ctx.lineTo(x + 4.5 * s, y + r * 0.5 - 7 * s);
+    ctx.closePath(); ctx.fillStyle = '#ffd166'; ctx.fill();
+  }
+  ctx.restore();
+}
+
+/* The 3D markers go through the same projection the facets did, so they sit
+   on the surface as it turns. Drawn last and unsorted: a marker hidden behind
+   the part it is attached to would be worse than one that shows through. */
+function drawPicks3d(ctx, rot, S){
+  for(const p of PICKS3D){
+    const q = S(rot([p.x, p.y, p.z]));
+    ctx.save();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = p.role === 'fixed' ? '#7dd3fc' : '#ffd166';
+    ctx.fillStyle = 'rgba(0,0,0,.45)';
+    ctx.beginPath(); ctx.arc(q[0], q[1], 9, 0, 6.2832); ctx.fill(); ctx.stroke();
+    ctx.beginPath();
+    if(p.role === 'fixed'){
+      ctx.moveTo(q[0] - 6, q[1] + 6); ctx.lineTo(q[0] + 6, q[1] + 6);
+      ctx.moveTo(q[0] - 4, q[1] + 6); ctx.lineTo(q[0] - 7, q[1] + 10);
+      ctx.moveTo(q[0], q[1] + 6);     ctx.lineTo(q[0] - 3, q[1] + 10);
+      ctx.moveTo(q[0] + 4, q[1] + 6); ctx.lineTo(q[0] + 1, q[1] + 10);
+    }else{
+      ctx.moveTo(q[0], q[1] - 7); ctx.lineTo(q[0], q[1] + 5);
+      ctx.moveTo(q[0] - 4, q[1]); ctx.lineTo(q[0], q[1] + 5);
+      ctx.lineTo(q[0] + 4, q[1]);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function picksForPost(){
+  return PICKS.map(p => ({role: p.role, x: p.x, y: p.y, r: p.r,
+                          label: p.label}));
+}
+function picks3dForPost(){
+  return PICKS3D.map(p => ({role: p.role, x: p.x, y: p.y, z: p.z, r: p.r}));
+}
+
+function initPicks(){
+  $('cv').addEventListener('click', e => {if(view === 'stress') flatClick($('cv'), e)});
+  $('cvp').addEventListener('click', e => {if(view === 'pocket') flatClick($('cvp'), e)});
+  $('cv3d').addEventListener('click', solidClick);
+  $('loadCase').addEventListener('change', loadUnitLabel);
+  $('load').addEventListener('input', renderPickList);
+  loadUnitLabel(); renderPickList();
+}
+
 
 /* Stress-view caption: the load case actually solved, then the features the
    solver found driving the field. Drivers come from the server because they
@@ -1807,6 +2191,11 @@ function renderPocket(d){
   for(const h of pk.hole_notes||[]) drawHoleRing(g,h,s,d);
   for(const p of labelledPockets(pk.pockets||[],s)) drawChip(g,p,s);
   if(pk.keep_note) drawKeepCallout(g,pk.keep_note,W,H,s);
+  // The same supports and loads as the stress map. The pocketing plan IS the
+  // stress map's answer turned into cuts, so being able to move a support
+  // here -- and see which ribs stop being needed -- is the whole point of
+  // having it on this view rather than only on the other one.
+  drawPicks(g,s,flatScale(cvp));
   drawPocketKey(d);
 }
 
@@ -2529,6 +2918,7 @@ function pickExample(i){
 }
 buildThumbs();
 drawDemo(PARTS[0]);
+initPicks();
 
 </script>
 </body>

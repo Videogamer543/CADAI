@@ -6,7 +6,8 @@ from __future__ import annotations
 import os
 import numpy as np
 from .geometry import extract_polygons
-from .mesh import build_mesh, refine_by_field, density_preset
+from .mesh import (build_mesh, refine_by_field, refine_to_width,
+                   density_preset)
 from .fem import solve_plane_stress
 from . import materials, raster, pocketing
 
@@ -26,12 +27,107 @@ MODE_KT = {"full": 1.0, "structural": 1.0, "fatigue": 1.35, "manufacturing": 1.1
 # failure that shows up as a 503 with an empty body and no traceback.
 MAX_ELEMS = max(4000, int(os.environ.get("CADAI_MAX_ELEMS", "45000")))
 
+# Elements to fit across the local width of material, in the pre-solve sizing
+# pass. Sits between MESH_BAD (3, below which the number is not worth quoting)
+# and MESH_OK (6, above which refining stops changing much) -- aimed at the
+# useful end of "fair" without spending the whole budget chasing "good" on a
+# part whose webs are a hundredth of its span.
+FEATURE_ACROSS = float(os.environ.get("CADAI_FEATURE_ACROSS", "4.0"))
+
+
+def _width_map(exterior, holes, W, H, steps=20):
+    """Local THICKNESS of material, in pixels, at every pixel of the part.
+
+    Not distance-to-boundary. That was the first attempt and it is wrong in a
+    way worth recording, because it looks right: 2 x distance-to-boundary does
+    equal the web width along a web's centreline, but five pixels in from the
+    edge of a solid 400 mm plate it reads ten pixels, and a mesh sized from it
+    refines the rim of every part ever solved. The test that caught it was a
+    plain square with no thin anything in it, which came back with 2.6x the
+    elements it went in with.
+
+    What is wanted is the standard local-thickness measure: the diameter of the
+    largest disc that fits inside the material AND covers this pixel. In a web
+    of width t every pixel is covered by the disc of radius t/2 centred on the
+    centreline, so the whole web reads t; in open stock the covering disc is
+    huge and the pixel reads huge, however close to an edge it sits.
+
+    Computed by sweeping radius from large to small: a disc of radius r fits
+    wherever the distance transform is at least r, and the set covered by all
+    such discs is a second distance transform away. Largest radius wins, so
+    each pixel is claimed once, by the biggest disc that reaches it.
+
+    Returns (thickness_array, neck_px) or (None, 0.0). Every failure returns
+    None rather than raising -- this pass improves the mesh, it is not a
+    precondition for solving, and a part that will not rasterise should still
+    get the answer the previous build gave.
+    """
+    try:
+        import cv2
+        import scipy.ndimage as ndi
+    except Exception:
+        return None, 0.0
+    try:
+        part_mask, hole_mask = raster.masks_from_polygons(exterior, holes, W, H)
+        solid = (part_mask & ~hole_mask).astype(np.uint8)
+        if not solid.any():
+            return None, 0.0
+        # One pixel of background all the way round before measuring.
+        #
+        # A part whose outline reaches the edge of the raster leaves no
+        # background for the distance transform to measure against, and OpenCV
+        # answers with ~1e38 -- which then overflows float32 on the next
+        # multiply and poisons the whole field with inf. It showed up as an
+        # overflow warning on a test part that happened to fill its frame
+        # exactly. Padding is also the physically right answer: the part's
+        # outer edge IS a boundary, and material there is no thicker than the
+        # distance to it.
+        solid = cv2.copyMakeBorder(solid, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+        dt = cv2.distanceTransform(solid, cv2.DIST_L2, 3)
+        dt = np.nan_to_num(dt, nan=0.0, posinf=0.0, neginf=0.0)
+        rmax = float(dt.max())
+        if rmax <= 1.0:
+            return None, 0.0
+        inside = solid.astype(bool)
+
+        thick = np.zeros_like(dt)
+        # Geometric spacing, not linear: thin features are where the answer
+        # matters and where a 1 px error is a large relative error, so the
+        # radii bunch up at the small end.
+        for r in np.geomspace(rmax, 0.75, num=max(6, int(steps))):
+            core = (dt >= r)
+            if not core.any():
+                continue
+            reach = cv2.distanceTransform((~core).astype(np.uint8),
+                                          cv2.DIST_L2, 3)
+            claim = inside & (reach <= r) & (thick == 0)
+            if claim.any():
+                thick[claim] = 2.0 * r
+        # Anything no disc reached (single-pixel slivers at a corner) falls
+        # back to the local distance, which there is the honest answer.
+        left = inside & (thick == 0)
+        if left.any():
+            thick[left] = 2.0 * dt[left]
+        # Back to the caller's coordinate system -- the pad was ours.
+        thick = thick[1:-1, 1:-1]
+        dt = dt[1:-1, 1:-1]
+
+        # The narrowest real neck, measured the way it always was -- along the
+        # medial ridge, where distance-to-boundary genuinely is half the local
+        # width. Unchanged on purpose: this number is already reported to users
+        # and drives the "thin sections" driver.
+        ridge = (dt >= ndi.maximum_filter(dt, size=3) - 1e-6) & (dt > 1.0)
+        neck = float(np.percentile(2.0 * dt[ridge], 10)) if ridge.any() else 0.0
+        return thick, neck
+    except Exception:
+        return None, 0.0
+
 
 def run(data: bytes, *, material="Aluminum 6061-T6", mode="structural",
         load_case="cantilever", orientation="horizontal", load=500.0,
         do_pocketing=False, px_per_mm=None, rib_mm=3.0, density="normal",
         max_area=None, thickness_mm=6.35, adapt=True,
-        mesh_density="standard"):
+        mesh_density="standard", picks=None):
     """`density` is the POCKETING density (how much material comes off).
     `mesh_density` is how finely the part is cut into triangles for the solve
     -- "draft", "standard", "fine" or "ultra". They are unrelated knobs that
@@ -48,6 +144,38 @@ def run(data: bytes, *, material="Aluminum 6061-T6", mode="structural",
                                             target_tris=tgt_tris,
                                             return_pslg=True)
 
+    # Size the mesh against the part's own thin sections before solving it.
+    #
+    # The element budget used to be spent uniformly, which meant a part made of
+    # narrow webs got the same triangle size in a 2 mm ligament as in open
+    # stock -- and then the report told the reader their mesh was too coarse to
+    # trust and to re-run finer, advice that on a web-heavy part cannot be
+    # taken at any preset the interface offers (reaching six elements across a
+    # web that currently has two needs nine times the triangles). Refining only
+    # where the material is actually thin buys the same accuracy for a small
+    # fraction of the elements.
+    #
+    # Failures here are not fatal in either direction: no cv2, a degenerate
+    # outline, a mesher refusal all leave the uniform mesh in place, which is
+    # exactly what this build did before.
+    width_px, neck_px = _width_map(exterior, holes, W, H)
+    mesh_feature_pass = False
+    if width_px is not None:
+        try:
+            pts_w, tris_w = refine_to_width(pts, tris, pslg, width_px,
+                                            min_angle=min_angle,
+                                            across=FEATURE_ACROSS,
+                                            max_tris=cap_tris)
+            if tris_w.shape[0] > tris.shape[0]:
+                # Flagged only when it actually did something. A part with no
+                # thin sections picks up a handful of triangles at a hole rim,
+                # and reporting that as a refinement pass would put a line in
+                # the report for a change nobody can see.
+                mesh_feature_pass = tris_w.shape[0] > tris.shape[0] * 1.02
+                pts, tris = pts_w, tris_w
+        except Exception:
+            pass
+
     # px/mm — STEP supplies the true scale; for images assume long side ~150 mm
     if px_per_mm is None:
         px_per_mm = max(W, H) / 150.0
@@ -55,7 +183,8 @@ def run(data: bytes, *, material="Aluminum 6061-T6", mode="structural",
     kw = dict(E=mat["E"], nu=mat["nu"],
               thickness=max(0.0005, thickness_mm / 1000.0),
               m_per_px=1.0 / (px_per_mm * 1000.0),
-              load_case=load_case, orientation=orientation, load=load)
+              load_case=load_case, orientation=orientation, load=load,
+              picks=picks)
 
     res = solve_plane_stress(pts, tris, **kw)
 
@@ -96,6 +225,14 @@ def run(data: bytes, *, material="Aluminum 6061-T6", mode="structural",
     res["holes"] = len(holes)
     res["px_per_mm"] = px_per_mm
     res["thickness_mm"] = thickness_mm
+    res["mesh_feature_pass"] = bool(mesh_feature_pass)
+    # Measured once, before meshing, and reused. _drivers used to compute this
+    # itself after the solve, which meant the number driving the "too coarse"
+    # verdict and the number driving the mesh were two separate distance
+    # transforms of the same part.
+    if neck_px > 0:
+        res["min_ligament_px"] = neck_px
+        res["min_ligament_mm"] = neck_px / (px_per_mm or 1.0)
 
     # How the part splits between "keep", "watch" and "free to remove", by
     # AREA rather than by node count. A node census answers a question nobody
@@ -122,7 +259,7 @@ def run(data: bytes, *, material="Aluminum 6061-T6", mode="structural",
     # a reader who can see the element count and how many elements sit across
     # the part's thinnest section can judge the picture for themselves.
     res["mesh"] = _mesh_report(res, mesh_density, tgt_tris, cap_tris,
-                               cap_asked)
+                               cap_asked, width_px=width_px)
 
     if do_pocketing:
         part_mask, hole_mask = raster.masks_from_polygons(exterior, holes, W, H)
@@ -159,7 +296,8 @@ def run(data: bytes, *, material="Aluminum 6061-T6", mode="structural",
 MESH_BAD, MESH_OK = 3.0, 6.0
 
 
-def _mesh_report(res, preset, target_tris, cap_tris, cap_asked=None):
+def _mesh_report(res, preset, target_tris, cap_tris, cap_asked=None,
+                 width_px=None):
     """Element count, typical element size, and an honest verdict on both.
 
     The useful measure is not how many triangles there are -- 30,000 on a
@@ -175,6 +313,7 @@ def _mesh_report(res, preset, target_tris, cap_tris, cap_asked=None):
            "dofs": int(res.get("n_dofs") or 0),
            "target_tris": int(target_tris), "cap_tris": int(cap_tris),
            "adaptive_pass": bool(res.get("adaptive_pass")),
+           "feature_pass": bool(res.get("mesh_feature_pass")),
            "elements_before_refine": int(res.get("mesh_pass1_elems") or 0)}
     # If the server's memory budget clipped the preset, say so on the result
     # rather than quietly handing back a coarser mesh than was asked for.
@@ -201,16 +340,69 @@ def _mesh_report(res, preset, target_tris, cap_tris, cap_asked=None):
     if ppm > 0:
         out["elem_size_mm"] = edge_px / ppm
 
-    lig = float(res.get("min_ligament_px") or 0.0)
-    if lig > 0 and edge_px > 0:
-        across = lig / edge_px
+    # How big the elements are IN THE THIN MATERIAL, which is a different
+    # number from the part average as soon as the mesh is graded.
+    #
+    # The sentence this feeds says "N elements fit across the thinnest section
+    # of this part". Computed from the mean element over the whole part that
+    # sentence is false whenever the mesh is deliberately finer in the webs
+    # than in open stock -- the average is dominated by the large triangles in
+    # the open middle, so a web meshed six elements deep still reports two.
+    # The report would have hidden the very pass that fixed the problem.
+    lig_px = float(res.get("min_ligament_px") or 0.0)
+    thin_edge = edge_px
+    if width_px is not None and lig_px > 0:
+        try:
+            Wm = np.asarray(width_px)
+            cx = np.clip(np.rint((a[:, 0] + b[:, 0] + c[:, 0]) / 3.0),
+                         0, Wm.shape[1] - 1).astype(np.int64)
+            cy = np.clip(np.rint((a[:, 1] + b[:, 1] + c[:, 1]) / 3.0),
+                         0, Wm.shape[0] - 1).astype(np.int64)
+            local = Wm[cy, cx]
+            # Triangles sitting in material no more than half again as thick
+            # as the narrowest neck -- the thin sections, as opposed to the
+            # part.
+            sel = (local > 0) & (local <= 1.5 * lig_px)
+            if sel.sum() >= 8:
+                thin_edge = float(np.sqrt(float(area[sel].mean())
+                                          * 4.0 / np.sqrt(3.0)))
+                out["elem_size_thin_px"] = thin_edge
+                if ppm > 0:
+                    out["elem_size_thin_mm"] = thin_edge / ppm
+        except Exception:
+            thin_edge = edge_px
+
+    lig = lig_px
+    if lig > 0 and thin_edge > 0:
+        # Against the elements in the thin material, not the part average.
+        across = lig / thin_edge
         out["elements_across_thinnest"] = across
         if across < MESH_BAD:
             out["verdict"] = "coarse"
-            out["note"] = ("Only about %.1f elements fit across the thinnest "
-                           "section of this part. That is too few to trust the "
-                           "stress there — re-run at a finer mesh before "
-                           "quoting the number." % across)
+            # Whether a finer preset can actually fix this, worked out rather
+            # than assumed. Element edge falls as 1/sqrt(count), so reaching
+            # MESH_BAD needs (MESH_BAD/across)^2 times the elements. Telling
+            # someone to re-run finer when the ceiling is below that figure
+            # sends them round a loop that cannot close -- which is exactly
+            # what happened to the user this check was written for, who went
+            # to "fine" and watched 2.0 become 2.1.
+            need = int(tris.shape[0] * (MESH_BAD / max(across, 0.1)) ** 2)
+            out["elements_for_fair"] = need
+            if need <= cap_tris * 0.95:
+                out["note"] = ("Only about %.1f elements fit across the "
+                               "thinnest section of this part. That is too few "
+                               "to trust the stress there — a finer mesh "
+                               "setting (about %s elements) would fix it."
+                               % (across, f"{need:,}"))
+            else:
+                out["note"] = ("Only about %.1f elements fit across the "
+                               "thinnest section of this part, and a uniform "
+                               "mesh cannot fix that here — it would take "
+                               "about %s elements against a ceiling of %s. "
+                               "The webs are very narrow next to the part's "
+                               "overall size. Treat the peak as indicative; "
+                               "the places it points at are still right."
+                               % (across, f"{need:,}", f"{cap_tris:,}"))
         elif across < MESH_OK:
             out["verdict"] = "fair"
             out["note"] = ("About %.1f elements across the thinnest section. "
@@ -243,24 +435,19 @@ def _drivers(res, exterior, holes, W, H):
 
     span = float(max(W, H)) or 1.0
 
-    # Thin sections: measure the ligament width along the part's medial ridge.
-    # Distance-to-boundary at a ridge pixel is half the local wall thickness, so
-    # a low percentile of 2*dt is the narrowest real neck -- as opposed to the
-    # distance at an arbitrary pixel, which is near zero everywhere along every
-    # edge and would call every part thin.
+    # Thin sections. The neck is normally measured before meshing, because the
+    # mesh is sized from it; this falls back to measuring it here only when
+    # that pass could not run, so the driver list does not silently lose an
+    # entry on a machine without cv2.
     try:
-        import cv2
-        import scipy.ndimage as ndi
-        part_mask, hole_mask = raster.masks_from_polygons(exterior, holes, W, H)
-        solid = (part_mask & ~hole_mask).astype(np.uint8)
-        dt = cv2.distanceTransform(solid, cv2.DIST_L2, 3)
-        ridge = (dt >= ndi.maximum_filter(dt, size=3) - 1e-6) & (dt > 1.0)
-        if ridge.any():
-            neck = float(np.percentile(2.0 * dt[ridge], 10))
-            res["min_ligament_px"] = neck
-            res["min_ligament_mm"] = neck / (res.get("px_per_mm") or 1.0)
-            if neck < 0.09 * span:
-                out.append("Thin sections")
+        neck = float(res.get("min_ligament_px") or 0.0)
+        if neck <= 0:
+            width, neck = _width_map(exterior, holes, W, H)
+            if neck > 0:
+                res["min_ligament_px"] = neck
+                res["min_ligament_mm"] = neck / (res.get("px_per_mm") or 1.0)
+        if 0 < neck < 0.09 * span:
+            out.append("Thin sections")
     except Exception:
         pass
 

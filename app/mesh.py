@@ -108,6 +108,129 @@ def build_mesh(exterior, holes, max_area=None, min_angle=30.0,
     return verts, tris, A, min_angle
 
 
+def refine_to_width(verts, tris, pslg, width_px, min_angle=30.0,
+                    across=3.5, max_tris=32000):
+    """Put small triangles where the MATERIAL is thin, before any solve.
+
+    Why this exists, in one measurement. A user ran a truss-like plate at the
+    "fine" preset, got 12,115 triangles, and was told only 2.0 elements fit
+    across its thinnest web -- too few to trust -- and to re-run finer. They
+    did. It barely moved, and the reason is arithmetic: element edge falls as
+    1/sqrt(count), so lifting 2.0 to the 6.0 at which refining stops changing
+    the answer needs 12,115 x (6/2)^2 = 109,000 triangles. This server's
+    ceiling is 45,000. The advice could not be taken on that part at any
+    setting the interface offers.
+
+    Uniform refinement is the wrong instrument. A 2 mm web inside a 400 mm
+    frame needs 0.6 mm elements in the web and nowhere else; sizing the WHOLE
+    part for the web spends ninety thousand triangles on open material where
+    a few hundred would do. So this sizes each triangle against the width of
+    material under it, taken from a distance transform of the part, and
+    leaves the open middle coarse.
+
+    width_px : HxW float array -- local material width in pixels at each pixel
+               (2 x distance-to-boundary), zero outside the part.
+    across   : how many elements to fit across the local width.
+
+    Returns (verts, tris); the input unchanged if there is nothing to do or
+    the re-triangulation fails.
+    """
+    verts = np.asarray(verts, dtype=np.float64)
+    tris = np.asarray(tris, dtype=np.int64)
+    Wmap = np.asarray(width_px, dtype=np.float64)
+    if Wmap.ndim != 2 or tris.shape[0] == 0 or tris.shape[0] >= max_tris:
+        return verts, tris
+
+    p = verts[tris]
+    cx = p[:, :, 0].mean(axis=1)
+    cy = p[:, :, 1].mean(axis=1)
+    area = 0.5 * np.abs(
+        (p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1]) -
+        (p[:, 2, 0] - p[:, 0, 0]) * (p[:, 1, 1] - p[:, 0, 1]))
+
+    h, w = Wmap.shape
+    ix = np.clip(np.rint(cx).astype(np.int64), 0, w - 1)
+    iy = np.clip(np.rint(cy).astype(np.int64), 0, h - 1)
+    local = Wmap[iy, ix]
+
+    # An equilateral triangle of edge e has area sqrt(3)/4 e^2. Asking for
+    # `across` elements over the local width fixes the edge, hence the area.
+    want_edge = local / max(float(across), 1.0)
+    want_area = (np.sqrt(3.0) / 4.0) * want_edge ** 2
+
+    # Only where the mesh is genuinely too coarse for the material under it.
+    # The 0.75 stops the mesher being handed a cap it already satisfies, which
+    # costs a re-triangulation and gains nothing.
+    hot = (local > 1.0) & (want_area < area * 0.75)
+    if not hot.any():
+        return verts, tris
+
+    # What this would cost, before paying for it. A capped triangle splits
+    # into roughly area/want_area children; everything else stays put.
+    def _estimate(scale):
+        wa = want_area * scale
+        return float(tris.shape[0] - hot.sum() +
+                     np.minimum(area[hot] / np.maximum(wa[hot], 1e-9),
+                                4000.0).sum())
+
+    scale = 1.0
+    if _estimate(scale) > max_tris:
+        # Coarsen the whole size field together rather than abandoning the
+        # thinnest regions, so the budget is spent in the proportions the
+        # geometry asked for -- just less of it.
+        lo, hi = 1.0, 1.0
+        for _ in range(24):
+            hi *= 1.6
+            if _estimate(hi) <= max_tris:
+                break
+        for _ in range(20):
+            mid = 0.5 * (lo + hi)
+            if _estimate(mid) <= max_tris:
+                hi = mid
+            else:
+                lo = mid
+        scale = hi
+
+    # Triangulate, then CHECK, then back off if the estimate was optimistic.
+    #
+    # The estimate is a count of how many children each capped triangle should
+    # split into, and it is systematically low: the quality constraint inserts
+    # its own vertices, and a cap near a hole rim propagates into neighbours
+    # that carried no cap at all. Measured on a lightening-hole frame it came
+    # in 12% under. A soft ceiling is not a ceiling -- the whole reason this
+    # budget exists is that overshooting it gets the process killed
+    # mid-factorisation and surfaces as a 503 with an empty body -- so the
+    # result is measured and the field coarsened until it really fits.
+    def _attempt(scale):
+        caps = np.full(tris.shape[0], -1.0)
+        caps[hot] = np.maximum(want_area[hot] * scale, 1e-9)
+        A = {"vertices": verts, "triangles": tris,
+             "triangle_max_area": caps.reshape(-1, 1)}
+        for k in ("segments", "holes"):
+            if pslg and k in pslg:
+                A[k] = pslg[k]
+        try:
+            B = tr.triangulate(A, f"prq{min_angle:g}aD")
+            return (np.asarray(B["vertices"], dtype=np.float64),
+                    np.asarray(B["triangles"], dtype=np.int64))
+        except Exception:
+            return None
+
+    for _ in range(5):
+        got = _attempt(scale)
+        if got is None:
+            return verts, tris
+        v2, t2 = got
+        if t2.shape[0] <= tris.shape[0]:
+            return verts, tris
+        if t2.shape[0] <= max_tris:
+            return v2, t2
+        # Overshot. Scale the areas by the square of the overshoot, which is
+        # the right first guess because count goes as 1/area.
+        scale *= max(1.25, (t2.shape[0] / float(max_tris)))
+    return verts, tris
+
+
 def refine_by_field(verts, tris, pslg, node_field, min_angle=30.0,
                     frac=0.30, shrink=0.28, max_tris=32000):
     """Cut the elements that matter smaller, then re-solve.

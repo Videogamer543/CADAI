@@ -67,6 +67,105 @@ def _facet_length(m, facets):
         return 0.0
 
 
+def _facet_mids(m, facets):
+    """Midpoint of each facet, as a (2, k) array in mesh units."""
+    fac = np.asarray(facets, dtype=np.int64)
+    if fac.size == 0:
+        return np.zeros((2, 0))
+    return np.asarray(m.p)[:, np.asarray(m.facets)[:, fac]].mean(axis=1)
+
+
+def _pick_facets(m, m_per_px, pick, boundary=None):
+    """Boundary facets inside a clicked disc.
+
+    One primitive serves both halves of "click where it is held and where it
+    is loaded", because from the solver's point of view a hole and a stretch
+    of outline are the same thing: a patch of boundary. The caller sends a
+    centre and a radius in the pixel coordinates the picture is drawn in --
+    for a bore, its centre and a little over its radius; for an edge click,
+    the click point and a capture radius -- and gets back the facets that
+    actually carry the condition.
+
+    Nothing here knows what a "hole" is, which is the point. A UI that
+    identifies features differently later does not need this to change.
+    """
+    if boundary is None:
+        boundary = m.boundary_facets()
+    boundary = np.asarray(boundary, dtype=np.int64)
+    if boundary.size == 0:
+        return boundary
+    mids = _facet_mids(m, boundary)
+    cx = float(pick.get("x", 0.0)) * m_per_px
+    cy = float(pick.get("y", 0.0)) * m_per_px
+    r = max(float(pick.get("r", 0.0)), 1.0) * m_per_px
+    d = np.hypot(mids[0] - cx, mids[1] - cy)
+    return boundary[d <= r]
+
+
+def _facet_loops(m):
+    """Split the boundary into closed loops of FACETS, outer one first.
+
+    Named for facets on purpose. There is already a _boundary_loops(points,
+    tris) further down that walks the same curves in NODE space, for reporting
+    hole geometry; this one is needed because a traction has to be integrated
+    over facets, and node loops cannot be handed to a FacetBasis. The first
+    version of this was also called _boundary_loops, which silently redefined
+    the older one -- Python kept the last definition, so the hub lookup called
+    a function expecting different arguments and the whole case raised. Two
+    jobs, two names.
+
+    Needed because "apply a torque at the hub" means applying it around a
+    bore, and a bore is a boundary loop that is not the outside of the part.
+    The mesher does not label them, so they are recovered by walking the
+    facet graph: every boundary vertex has exactly two boundary facets, so
+    following one from the next traces a loop and stops where it started.
+
+    Returns a list of facet-index arrays. The loop with the largest bounding
+    box is the outside and is returned first; everything after it is a hole.
+    """
+    bf = np.asarray(m.boundary_facets(), dtype=np.int64)
+    if bf.size == 0:
+        return []
+    fv = np.asarray(m.facets)[:, bf]                 # (2, k) vertex ids
+    adj = {}
+    for i in range(bf.size):
+        for a, b in ((fv[0, i], fv[1, i]), (fv[1, i], fv[0, i])):
+            adj.setdefault(int(a), []).append((int(b), i))
+    seen = np.zeros(bf.size, bool)
+    loops = []
+    for start in range(bf.size):
+        if seen[start]:
+            continue
+        chain = [start]
+        seen[start] = True
+        head = int(fv[1, start])
+        tail = int(fv[0, start])
+        while True:
+            nxt = None
+            for v, fi in adj.get(head, ()):
+                if not seen[fi]:
+                    nxt = (v, fi)
+                    break
+            if nxt is None:
+                break
+            head = nxt[0]
+            seen[nxt[1]] = True
+            chain.append(nxt[1])
+            if head == tail:
+                break
+        loops.append(bf[np.asarray(chain, dtype=np.int64)])
+    if not loops:
+        return []
+    p = np.asarray(m.p)
+
+    def extent(fac):
+        v = np.unique(np.asarray(m.facets)[:, fac])
+        return float((np.ptp(p[0, v]) + 1e-18) * (np.ptp(p[1, v]) + 1e-18))
+
+    loops.sort(key=extent, reverse=True)
+    return loops
+
+
 def _nodal_areas(points_m, tris, N):
     """Each node's share of the plate (a third of every triangle it touches)."""
     p = points_m[tris]
@@ -360,7 +459,7 @@ def _spread(xy, n):
 
 def _bc_payload(m, points, tris, N, ax, trans_dof, load_case, load,
                 fixed_facets, fixed_nodes, load_facets, load_nodes,
-                applied, span_px, size_px, min_px):
+                applied, span_px, size_px, min_px, picked=False):
     """Where the part is held and where the force goes, in node coordinates.
 
     Everything here is read back out of the boundary conditions the solve
@@ -427,6 +526,12 @@ def _bc_payload(m, points, tris, N, ax, trans_dof, load_case, load,
         "load_case": load_case,
         "load_n": float(load),
         "load_applied_as": applied,
+        # A couple has no single direction to draw an arrow along, so the map
+        # is told which it is rather than left to infer it from the case name.
+        "load_kind": ("moment" if load_case in ("bending", "torque")
+                      else "force"),
+        "load_units": "N*m" if load_case in ("bending", "torque") else "N",
+        "picked": bool(picked),
         "distributed": bool(body),
         "two_ends": bool(load_case in ("ss_center", "ss_dist", "fixed_fixed")),
         # stretches of edge that are held, and where to put the hatch glyphs
@@ -454,7 +559,7 @@ def _bc_payload(m, points, tris, N, ax, trans_dof, load_case, load,
 
 def solve_plane_stress(points, tris, E=69e9, nu=0.33, thickness=0.00635,
                        load_case="cantilever", orientation="horizontal",
-                       load=500.0, m_per_px=1.0):
+                       load=500.0, m_per_px=1.0, picks=None):
     """
     points    : Nx2 float  mesh nodes in IMAGE PIXELS (returned unchanged)
     tris      : Mx3 int    triangle connectivity
@@ -499,6 +604,14 @@ def solve_plane_stress(points, tris, E=69e9, nu=0.33, thickness=0.00635,
 
     two_ends = load_case in ("ss_center", "ss_dist", "fixed_fixed")
 
+    # What the number in the box means. A force for the shear cases, a moment
+    # for the couple cases. Stating it rather than assuming Newtons everywhere
+    # is the difference between an answer and a number: 200 N on the end of a
+    # 300 mm arm and 200 N*m applied as a couple are not the same load, and a
+    # solver that silently treats one as the other is wrong by the span.
+    MOMENT_CASES = ("bending", "torque")
+    load_units = "N*m" if load_case in MOMENT_CASES else "N"
+
     def facets_where(fn):
         try:
             f = m.facets_satisfying(fn)
@@ -515,17 +628,79 @@ def solve_plane_stress(points, tris, E=69e9, nu=0.33, thickness=0.00635,
     fixed_facets = np.unique(np.concatenate([fix_lo, fix_hi])) \
         if fix_hi.size else fix_lo
 
+    # ---- picked supports override the banded ones ------------------------
+    #
+    # "Which of these thirty holes is bolted down" is a question a dropdown
+    # cannot answer and a sentence typed at an assistant answers badly. When
+    # the caller has pointed at the actual features, those win outright over
+    # the guessed end bands -- not merged with them, because a part held by
+    # one bore in the middle is not also clamped at its left edge, and quietly
+    # adding a support the user did not ask for makes it stiffer than it is.
+    picks = [q for q in (picks or []) if isinstance(q, dict)]
+    sup_picks = [q for q in picks if q.get("role") in ("fixed", "support")]
+    load_picks = [q for q in picks if q.get("role") == "load"]
+    pin_picks = [q for q in picks if q.get("role") == "pin"]
+    bnd = np.asarray(m.boundary_facets(), dtype=np.int64)
+    picked_support = False
+    if sup_picks:
+        got = [_pick_facets(m, m_per_px, q, bnd) for q in sup_picks]
+        got = [g for g in got if g.size]
+        if got:
+            fixed_facets = np.unique(np.concatenate(got))
+            picked_support = True
+
     # Constraining boundary facets (rather than every node inside a 6%-wide
     # slab of material) keeps the support where a real clamp actually is.
     if fixed_facets.size:
         D = np.asarray(basis.get_dofs(fixed_facets).flatten(), dtype=np.int64)
-        fixed_nodes = (coord <= s0 + fband)
-        if two_ends:
-            fixed_nodes |= (coord >= s1 - fband)
+        if picked_support:
+            fixed_nodes = np.zeros(N, bool)
+            vids = np.unique(np.asarray(m.facets)[:, fixed_facets])
+            vids = vids[(vids >= 0) & (vids < N)]
+            fixed_nodes[vids] = True
+        else:
+            fixed_nodes = (coord <= s0 + fband)
+            if two_ends:
+                fixed_nodes |= (coord >= s1 - fband)
     else:                                     # degenerate geometry fallback
         fixed_nodes = coord <= s0 + fband
         nd = basis.nodal_dofs
         D = np.concatenate([nd[0][fixed_nodes], nd[1][fixed_nodes]])
+
+    # ---- pins: hold the part still without holding it back ---------------
+    #
+    # A self-equilibrated load has no reaction to find. A ring under internal
+    # pressure pushes outward everywhere and the forces cancel exactly, so the
+    # stiffness matrix is singular by three: the part can drift in x, drift in
+    # y, and spin, all at zero energy, and the solve fails or returns garbage.
+    #
+    # Clamping an edge to fix that would be worse than the disease -- it would
+    # resist the expansion the problem is about and change the answer. A pin
+    # constrains ONE displacement component at ONE node, so three of them
+    # placed where that component is not the direction the part wants to move
+    # remove the drift and the spin and leave the stress field untouched. For
+    # a ring: hold y at the two ends of a horizontal diameter, and x at the
+    # top. Neither point is restrained radially, which is the only direction
+    # pressure pushes it.
+    #
+    # This is how the Lame benchmark is run, and the check that it is harmless
+    # is the benchmark itself: if a pin were taking load, the answer would not
+    # match the closed form.
+    if pin_picks:
+        nd_pin = basis.nodal_dofs
+        extra = []
+        for q in pin_picks:
+            px_ = float(q.get("x", 0.0)) * m_per_px
+            py_ = float(q.get("y", 0.0)) * m_per_px
+            i = int(np.argmin((points_m[:, 0] - px_) ** 2 +
+                              (points_m[:, 1] - py_) ** 2))
+            which = str(q.get("dofs") or "xy").lower()
+            if "x" in which:
+                extra.append(nd_pin[0][i])
+            if "y" in which:
+                extra.append(nd_pin[1][i])
+        if extra:
+            D = np.unique(np.concatenate([D, np.asarray(extra, np.int64)]))
 
     # ---- Neumann loading ------------------------------------------------
     # Distribute by *length* (or area), never by node count: the total force
@@ -551,7 +726,259 @@ def solve_plane_stress(points, tris, E=69e9, nu=0.33, thickness=0.00635,
         sel[vids] = True
         return sel
 
-    if load_case == "ss_dist":
+    def _couple_about(fac, moment, cx0=None, cy0=None):
+        """A pure couple of `moment` N*m applied over a patch of boundary.
+
+        Tangential traction, scaled so the moments come to exactly what was
+        asked for, and then corrected so no net FORCE comes with them.
+
+        That correction is not theoretical tidiness. The first version of this
+        asserted in its own docstring that "no net force comes out of it --
+        the tractions cancel round the loop", which is true of a closed loop
+        like a bore and false of every other patch. A click near the corner of
+        an end face selects a patch that wraps onto the adjacent edge, the
+        tangential directions there no longer oppose each other, and what gets
+        applied is a couple plus a sideways shove. On a cantilever that shove
+        bends the part, and the benchmark measured the result: a nominal
+        50 N*m delivered 2.88 times the bending stress it should have, and the
+        error grew with how much of the corner the patch caught.
+
+        So the resultant of the tangential field is measured and subtracted as
+        a uniform traction. Taken about the patch's own length-weighted
+        centroid, a uniform traction contributes no moment at all -- the
+        integral of r over the patch is zero there by definition -- so the
+        couple survives the correction untouched and the net force goes to
+        zero. On a closed bore the correction evaluates to nothing, which is
+        the old behaviour, correctly.
+        """
+        fb1 = FacetBasis(m, ElementTriP1(), facets=fac)
+
+        @Functional
+        def one(w):
+            return 1.0 + 0.0 * w.x[0]
+
+        L = float(asm(one, fb1))
+        if not np.isfinite(L) or L <= 0:
+            return None
+
+        # The length-weighted centroid, not the mean of the midpoints. They
+        # differ wherever the mesh is graded, and this is the one point about
+        # which the correction below is moment-free.
+        @Functional
+        def mx(w):
+            return w.x[0]
+
+        @Functional
+        def my(w):
+            return w.x[1]
+
+        cx0 = float(asm(mx, fb1)) / L
+        cy0 = float(asm(my, fb1)) / L
+
+        @Functional
+        def arm(w):
+            rx = w.x[0] - cx0
+            ry = w.x[1] - cy0
+            return np.sqrt(rx * rx + ry * ry)
+
+        A = float(asm(arm, fb1))
+        if not np.isfinite(A) or A <= 0:
+            return None
+        tau = float(moment) / (A * thk)
+
+        # Resultant of the unit tangential field, per component.
+        @Functional
+        def tgx(w):
+            rx = w.x[0] - cx0
+            ry = w.x[1] - cy0
+            return -ry / (np.sqrt(rx * rx + ry * ry) + 1e-15)
+
+        @Functional
+        def tgy(w):
+            rx = w.x[0] - cx0
+            ry = w.x[1] - cy0
+            return rx / (np.sqrt(rx * rx + ry * ry) + 1e-15)
+
+        corr_x = -tau * float(asm(tgx, fb1)) / L
+        corr_y = -tau * float(asm(tgy, fb1)) / L
+
+        @LinearForm
+        def torq(v, w):
+            rx = w.x[0] - cx0
+            ry = w.x[1] - cy0
+            rr = np.sqrt(rx * rx + ry * ry) + 1e-15
+            return thk * ((tau * (-ry / rr) + corr_x) * v[0] +
+                          (tau * (rx / rr) + corr_y) * v[1])
+
+        return asm(torq, FacetBasis(m, e, facets=fac))
+
+    def _end_moment(fac, moment):
+        """A pure bending moment on an end face, as linearly varying pull.
+
+        What makes this different from the cantilever case, and worth having
+        separately: a tip load puts a moment on the root that grows along the
+        span and carries shear with it, so the stress depends on where you
+        look. A couple on the end puts the SAME moment everywhere with no
+        shear at all, which is the textbook pure-bending state and the right
+        model for a link loaded through its ends. The traction is axial and
+        proportional to distance from the face's own centreline -- tension on
+        one side, compression on the other, no net force.
+        """
+        mids = _facet_mids(m, fac)
+        c = float(mids[trans_dof].mean())
+
+        @Functional
+        def second(w):
+            d = w.x[trans_dof] - c
+            return d * d
+
+        I = float(asm(second, FacetBasis(m, ElementTriP1(), facets=fac)))
+        if not np.isfinite(I) or I <= 0:
+            return None
+        k = float(moment) / (I * thk)
+
+        @LinearForm
+        def bend(v, w):
+            return thk * k * (w.x[trans_dof] - c) * v[ax]
+
+        return asm(bend, FacetBasis(m, e, facets=fac))
+
+    # ---- picked loads override the load case ----------------------------
+    #
+    # Same reasoning as the picked supports: if the caller has said which bore
+    # takes the force, that is the load, and the dropdown's guess is not also
+    # applied. Each pick carries its force in newtons as components, and/or a
+    # torque in newton-metres, so one click can be "500 N downward on this
+    # hole" and another "12 N*m about this hub".
+    if load_picks:
+        parts, used = [], []
+        # A click that carries no direction is the common case and the point of
+        # the whole feature: "the load goes HERE" is a complete thought, and
+        # making someone also pick a compass arrow before anything happens
+        # turns placing a load into filling in a form. So a bare pick inherits
+        # the load case's own direction -- the same transverse axis the
+        # dropdown would have used -- and the total from the load box is split
+        # evenly between however many load points were placed. Two clicks at
+        # 500 N is 250 N each, not 500 N each, because the number in the box
+        # says what the part carries.
+        bare = [q for q in load_picks
+                if not (q.get("fx") or q.get("fy") or q.get("torque")
+                        or q.get("pressure"))]
+        if bare:
+            share = float(load) / len(bare)
+            for q in load_picks:
+                if not (q.get("fx") or q.get("fy") or q.get("torque")
+                        or q.get("pressure")):
+                    d = [0.0, 0.0]
+                    d[trans_dof] = -share
+                    q["fx"], q["fy"] = d[0], d[1]
+                    q["auto_dir"] = True
+        for q in load_picks:
+            sel = _pick_facets(m, m_per_px, q, bnd)
+            if sel.size == 0:
+                continue
+            L = _facet_length(m, sel)
+            if L <= 0:
+                continue
+            fx, fy = float(q.get("fx") or 0.0), float(q.get("fy") or 0.0)
+            if fx or fy:
+                tx, ty = fx / (L * thk), fy / (L * thk)
+
+                @LinearForm
+                def edgeload(v, w, tx=tx, ty=ty):
+                    return thk * (tx * v[0] + ty * v[1])
+
+                parts.append(asm(edgeload, FacetBasis(m, e, facets=sel)))
+                used.append(sel)
+            # Pressure: a normal traction, the one load a direction arrow
+            # cannot express. The traction on a surface under pressure p is
+            # -p*n with n the material's OUTWARD normal, so on the wall of a
+            # bore -- where the outward normal points into the hole -- it
+            # pushes the material away from the hole axis, which is what
+            # internal pressure does. Needed for the Lame thick-cylinder
+            # check, and the right model for a bore under hydraulic pressure
+            # or a press fit.
+            pr = float(q.get("pressure") or 0.0)
+            if pr:
+                @LinearForm
+                def pressload(v, w, pr=pr):
+                    return -pr * thk * (w.n[0] * v[0] + w.n[1] * v[1])
+
+                parts.append(asm(pressload, FacetBasis(m, e, facets=sel)))
+                used.append(sel)
+            T = float(q.get("torque") or 0.0)
+            if T:
+                mids = _facet_mids(m, sel)
+                vec = _couple_about(sel, T, float(mids[0].mean()),
+                                    float(mids[1].mean()))
+                if vec is not None:
+                    parts.append(vec)
+                    used.append(sel)
+        if parts:
+            for vec in parts:
+                f = f + vec
+            load_facets = np.unique(np.concatenate(used))
+            load_nodes = _facet_nodes(load_facets)
+            applied = "picked features"
+        else:
+            applied = "picked features matched no edge"
+    elif load_case == "axial":
+        # Straight pull (or push) along the span. The simplest case there is,
+        # and the one every other case is measured against -- a part that
+        # cannot be checked in pure tension is not telling you much in bending.
+        lf = facets_where(lambda x: x[ax] >= s1 - band)
+        load_facets = np.asarray(lf, dtype=np.int64)
+        L = _facet_length(m, lf)
+        if lf.size and L > 0:
+            trac = load / (L * thk)
+
+            @LinearForm
+            def pull(v, w):
+                return trac * thk * v[ax]
+
+            f = asm(pull, FacetBasis(m, e, facets=lf))
+            load_nodes = _facet_nodes(lf)
+            applied = "axial traction"
+    elif load_case == "bending":
+        lf = facets_where(lambda x: x[ax] >= s1 - band)
+        load_facets = np.asarray(lf, dtype=np.int64)
+        vec = _end_moment(lf, load) if lf.size else None
+        if vec is not None:
+            f = vec
+            load_nodes = _facet_nodes(lf)
+            applied = "end couple (pure bending)"
+        else:
+            applied = "end couple failed - no end face found"
+    elif load_case == "torque":
+        # Torque about the plate's normal, applied where a torque actually
+        # goes in: the hub. The largest bore is the hub on the overwhelming
+        # majority of parts that have one -- a sprocket boss, a bearing seat,
+        # a shaft clamp -- and when a part has no holes at all there is
+        # nothing to twist through, so the couple goes on the end face and the
+        # result says so rather than pretending a hub was found.
+        loops = _facet_loops(m)
+        hub = None
+        if len(loops) > 1:
+            hub = max(loops[1:], key=lambda fac: _facet_length(m, fac))
+        if hub is not None and hub.size:
+            mids = _facet_mids(m, hub)
+            vec = _couple_about(hub, load, float(mids[0].mean()),
+                                float(mids[1].mean()))
+            if vec is not None:
+                f = vec
+                load_facets = hub
+                load_nodes = _facet_nodes(hub)
+                applied = "torque about the largest bore"
+        if load_facets.size == 0:
+            lf = facets_where(lambda x: x[ax] >= s1 - band)
+            vec = _end_moment(lf, load) if lf.size else None
+            if vec is not None:
+                f = vec
+                load_facets = np.asarray(lf, dtype=np.int64)
+                load_nodes = _facet_nodes(lf)
+                applied = ("no bore to twist through - couple applied to the "
+                           "end face instead")
+    elif load_case == "ss_dist":
         # Uniform pressure over the whole plate (e.g. its own supported load).
         @Functional
         def area(w):
@@ -772,7 +1199,8 @@ def solve_plane_stress(points, tris, E=69e9, nu=0.33, thickness=0.00635,
                          float(max(np.ptp(points[:, 0]),
                                    np.ptp(points[:, 1]))),
                          float(min(np.ptp(points[:, 0]),
-                                   np.ptp(points[:, 1]))))
+                                   np.ptp(points[:, 1]))),
+                         picked=bool(picked_support or load_picks))
     except Exception as ex:
         bc = {"error": str(ex)}
 
@@ -813,4 +1241,6 @@ def solve_plane_stress(points, tris, E=69e9, nu=0.33, thickness=0.00635,
         "n_dofs": int(basis.N),
         "n_elems": int(np.asarray(tris).shape[0]),
         "load_case": load_case,
+        "load_units": load_units,
+        "picked_features": int(len(picks)),
     }

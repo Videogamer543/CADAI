@@ -207,7 +207,7 @@ def _mesh_image(data: bytes, thickness_mm: float, px_per_mm=None,
 def run(data: bytes, *, filename="part", material="Aluminum 6061-T6",
         mode="structural", load_case="cantilever", orientation="horizontal",
         load=500.0, thickness_mm=6.35, px_per_mm=None,
-        target_tets=TARGET_TETS):
+        target_tets=TARGET_TETS, picks=None):
     """Solid stress map. Returns the payload the 3D viewer paints."""
     from .fem3d import solve_solid
 
@@ -279,7 +279,8 @@ def run(data: bytes, *, filename="part", material="Aluminum 6061-T6",
 
     res = solve_solid(nodes_mm, tets, E=mat["E"], nu=mat["nu"],
                       load_case=load_case, orientation=orientation,
-                      load=float(load), quadratic=quadratic)
+                      load=float(load), quadratic=quadratic,
+                      picks=picks)
 
     # Same stress-concentration multiplier the flat path applies, so a part
     # analysed both ways reports one safety factor, not two.

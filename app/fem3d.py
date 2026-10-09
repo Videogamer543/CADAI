@@ -224,8 +224,36 @@ def _linsolve(K, f, D):
     return solve(*sysm), "SuperLU (scipy)"
 
 
+def _pick_facets3d(m, pick, boundary=None):
+    """Boundary facets of a tet mesh inside a clicked sphere.
+
+    The three-dimensional twin of _pick_facets in app/fem.py, and deliberately
+    the same shape: a centre, a radius, and whatever boundary falls inside.
+    The viewer ray-picks a point on the visible surface and sends it in
+    millimetres -- the units the STEP file and this function's `nodes_mm`
+    argument both use -- so nothing has to agree about scale beyond that.
+
+    A sphere, rather than a face index, because the tessellation the viewer
+    draws and the tetrahedral surface the solver holds are two different
+    meshes of the same solid. A facet number from one is meaningless in the
+    other; a point in space means the same thing in both.
+    """
+    if boundary is None:
+        boundary = m.boundary_facets()
+    boundary = np.asarray(boundary, np.int64)
+    if boundary.size == 0:
+        return boundary
+    mids = np.asarray(m.p)[:, np.asarray(m.facets)[:, boundary]].mean(axis=1)
+    c = np.array([float(pick.get("x", 0.0)), float(pick.get("y", 0.0)),
+                  float(pick.get("z", 0.0))]) * 1e-3
+    r = max(float(pick.get("r", 0.0)), 1e-6) * 1e-3
+    d = np.sqrt(((mids - c[:, None]) ** 2).sum(axis=0))
+    return boundary[d <= r]
+
+
 def solve_solid(nodes_mm, tets, *, E=69e9, nu=0.33, load_case="cantilever",
-                orientation="horizontal", load=500.0, quadratic=True):
+                orientation="horizontal", load=500.0, quadratic=True,
+                picks=None):
     """
     nodes_mm : (N,3) node coordinates in MILLIMETRES (STEP's native unit)
     tets     : (M,4) tetrahedra
@@ -287,9 +315,29 @@ def solve_solid(nodes_mm, tets, *, E=69e9, nu=0.33, load_case="cantilever",
     fixed_facets = np.unique(np.concatenate([fix_lo, fix_hi])) \
         if fix_hi.size else fix_lo
 
+    # ---- clicked features win over the banded guess ---------------------
+    # Same rule as the 2D path: what was pointed at replaces what was guessed,
+    # and nothing is merged. See app/fem.py for why adding to the preset's
+    # supports instead of replacing them makes the part stiffer than it is.
+    picks = [q for q in (picks or []) if isinstance(q, dict)]
+    sup_picks = [q for q in picks if q.get("role") in ("fixed", "support")]
+    load_picks = [q for q in picks if q.get("role") == "load"]
+    bnd3 = np.asarray(m.boundary_facets(), np.int64)
+    picked_support = False
+    if sup_picks:
+        got = [_pick_facets3d(m, q, bnd3) for q in sup_picks]
+        got = [g for g in got if g.size]
+        if got:
+            fixed_facets = np.unique(np.concatenate(got))
+            picked_support = True
+
     fixed_nodes = (s <= s0 + fband)
     if two_ends:
         fixed_nodes |= (s >= s1 - fband)
+    if picked_support and fixed_facets.size:
+        fixed_nodes = np.zeros(N, bool)
+        vids = np.unique(np.asarray(m.facets)[:, fixed_facets])
+        fixed_nodes[vids[(vids >= 0) & (vids < N)]] = True
     if fixed_facets.size:
         D = np.asarray(basis.get_dofs(fixed_facets).flatten(), np.int64)
     else:
@@ -314,7 +362,53 @@ def solve_solid(nodes_mm, tets, *, E=69e9, nu=0.33, load_case="cantilever",
         except Exception:
             return 0.0
 
-    if load_case == "ss_dist":
+    if load_picks:
+        # Clicked load points. A point with no direction of its own takes the
+        # load case's direction and its share of the total -- the same rule as
+        # the 2D solver, for the same reason: pointing at the spot is the whole
+        # instruction, and demanding a vector as well turns it into a form.
+        bare = [q for q in load_picks
+                if not (q.get("fx") or q.get("fy") or q.get("fz"))]
+        share = (float(load) / len(bare)) if bare else 0.0
+        parts, used = [], []
+        for q in load_picks:
+            sel = _pick_facets3d(m, q, bnd3)
+            if sel.size == 0:
+                continue
+            A = facet_area(sel)
+            if A <= 0:
+                continue
+            if q.get("fx") or q.get("fy") or q.get("fz"):
+                vec = np.array([float(q.get("fx") or 0.0),
+                                float(q.get("fy") or 0.0),
+                                float(q.get("fz") or 0.0)])
+            else:
+                vec = -share * np.asarray(load_ax, float)
+            trac = vec / A                                # N/m^2, per axis
+
+            @LinearForm
+            def pickload(v, w, trac=trac):
+                d = np.zeros_like(v[0])
+                for i in range(3):
+                    d = d + trac[i] * v[i]
+                return d
+
+            parts.append(asm(pickload, FacetBasis(m, e, facets=sel,
+                                                  intorder=2)))
+            used.append(sel)
+        if parts:
+            for vec in parts:
+                f = f + vec
+            lf_all = np.unique(np.concatenate(used))
+            try:
+                vids = np.unique(np.asarray(m.facets)[:, lf_all])
+                load_nodes[vids[(vids >= 0) & (vids < N)]] = True
+            except Exception:
+                pass
+            applied = "picked features"
+        else:
+            applied = "picked features matched no surface"
+    elif load_case == "ss_dist":
         @Functional
         def volume(w):
             return 1.0 + 0.0 * w.x[0]
@@ -505,6 +599,17 @@ def solve_solid(nodes_mm, tets, *, E=69e9, nu=0.33, load_case="cantilever",
         "singular_nodes_excluded": singular,
         "element": "P2 tet (quadratic)" if quadratic else "P1 tet (linear)",
         "load_applied_as": applied,
+        # Echoed so the viewer can show whether a ray-picked point actually
+        # landed on the solver's surface. The tessellation on screen and the
+        # tetrahedral surface underneath are different meshes, so a click that
+        # looks fine can still fall outside every facet -- and silence would
+        # make that look like a solve that simply ignored it.
+        "picked": bool(picked_support or load_picks),
+        "picked_features": int(len(picks)),
+        "picked_support_pts": [[float(v) for v in q]
+                               for q in (np.asarray(m.p)[:, np.asarray(
+                                   m.facets)[:, fixed_facets]].mean(axis=1).T
+                                   * 1e3)[:400]] if picked_support else [],
         "n_nodes": int(N),
         "n_dofs": int(basis.N),
         "n_elems": int(t.shape[0]),

@@ -125,6 +125,72 @@ async def guard(request, call_next):
     return await call_next(request)
 
 
+MAX_PICKS = 64
+
+
+def _parse_picks(raw, dims=2):
+    """Clicked features, validated into something the solver can trust.
+
+    Everything in here arrives from a browser, so nothing is believed: the
+    role has to be one of two words, the numbers have to be finite, and the
+    list has a length limit. A malformed pick is dropped rather than raising,
+    because losing one click is a smaller failure than refusing to analyse the
+    part -- and a pick that was dropped is visible on the result, since the
+    supports and arrows are drawn from what the solve actually used.
+    """
+    if not raw:
+        return []
+    import json
+    import math
+    try:
+        items = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(items, list):
+        return []
+    out = []
+    for it in items[:MAX_PICKS]:
+        if not isinstance(it, dict):
+            continue
+        role = str(it.get("role") or "").lower()
+        if role not in ("fixed", "support", "load", "pin"):
+            continue
+
+        def num(key, default=0.0):
+            try:
+                v = float(it.get(key, default))
+            except (TypeError, ValueError):
+                return default
+            return v if math.isfinite(v) else default
+
+        r = num("r")
+        if r <= 0:
+            continue
+        rec = {"role": ("fixed" if role in ("fixed", "support") else role),
+               "x": num("x"), "y": num("y"), "r": r}
+        if rec["role"] == "pin":
+            dofs = str(it.get("dofs") or "xy").lower()
+            rec["dofs"] = "".join(c for c in dofs if c in "xy") or "xy"
+        if dims == 3:
+            rec["z"] = num("z")
+        if rec["role"] == "load":
+            # A load point with no vector is legal and is the normal case: the
+            # solver gives it the load case's own direction and its share of
+            # the total. Rejecting it here, which an earlier version did, made
+            # "click where the load goes" impossible without also choosing a
+            # compass direction first.
+            rec["fx"], rec["fy"] = num("fx"), num("fy")
+            if dims == 3:
+                rec["fz"] = num("fz")
+            rec["torque"] = num("torque")
+            rec["pressure"] = num("pressure")
+        lab = it.get("label")
+        if isinstance(lab, str):
+            rec["label"] = lab[:40]
+        out.append(rec)
+    return out
+
+
 @app.get("/api/health")
 def health():
     return {
@@ -178,6 +244,13 @@ async def analyze(
     # `density`, which is how much material the POCKETING takes off -- the two
     # both wanted the word "density" and neither would give it up.
     mesh_density: str = Form("standard"),
+    # Features the user clicked: a JSON list of
+    #   {"role":"fixed"|"load", "x":px, "y":px, "r":px,
+    #    "fx":N, "fy":N, "torque":N*m, "label":"..."}
+    # Sent as a string because this endpoint is multipart/form-data, which has
+    # no nested types -- the alternative was a parallel JSON endpoint, and one
+    # upload path that everything uses is worth a json.loads.
+    picks: str = Form(""),
 ):
     data = await limits.read_capped(file)
     name = (file.filename or "").lower()
@@ -291,6 +364,7 @@ async def analyze(
             orientation=orientation, load=load, do_pocketing=pocketing,
             rib_mm=rib_mm, density=density, mesh_density=mesh_density,
             px_per_mm=px_per_mm, thickness_mm=thickness_mm,
+            picks=_parse_picks(picks),
         )
     except Exception as e:
         import traceback
@@ -334,6 +408,10 @@ async def analyze3d(
     load: float = Form(500.0),
     load_context: str = Form(""),
     thickness_mm_in: float = Form(0.0),
+    # Points ray-picked off the 3D view, in MILLIMETRES -- the units the STEP
+    # solid is meshed in, so no scale has to be agreed anywhere else:
+    #   {"role":"fixed"|"load", "x":mm, "y":mm, "z":mm, "r":mm, "fx":N, ...}
+    picks: str = Form(""),
 ):
     """Solid stress map — a real tetrahedral FEA of the part as a 3D body.
 
@@ -370,7 +448,7 @@ async def analyze3d(
             analysis3d.run, data,
             filename=file.filename or "part", material=material, mode=mode,
             load_case=load_case, orientation=orientation, load=load,
-            thickness_mm=thickness_mm)
+            thickness_mm=thickness_mm, picks=_parse_picks(picks, dims=3))
     except Exception as e:
         import traceback
         traceback.print_exc()
