@@ -343,7 +343,11 @@ async def analyze(
             # typed — but say so, otherwise a stated "1/4 in" quietly vanishing
             # looks like the text was ignored.
             _typed_t = thickness_mm
-            data, px_per_mm, thickness_mm = silhouette_png(t)
+            # Without pocketing there is no pixel-cost argument for a coarse
+            # silhouette, and a curved edge traced out of one is where the
+            # remaining error on round features lives. See step3d.py.
+            data, px_per_mm, thickness_mm = silhouette_png(
+                t, target_ppm=(5.0 if pocketing else 16.0))
             thickness_source = "measured from the STEP solid"
             if _tess_note:
                 ctx.setdefault("detail", []).append(_tess_note)

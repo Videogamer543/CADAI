@@ -8,6 +8,7 @@ no global-state clashes, no event-loop blocking, and a crash can't take down the
 server. Falls back cleanly if gmsh isn't available.
 """
 from __future__ import annotations
+import math
 import os
 import sys
 import json
@@ -212,7 +213,7 @@ def measure_thickness(tess, plate_ratio=0.18):
     return round(thin, 3)
 
 
-def silhouette_png(tess, out_px=1500):
+def silhouette_png(tess, out_px=1500, target_ppm=None):
     """Project a STEP tessellation onto the plate's own plane and rasterize a
     filled silhouette, so a STEP plate can flow through the same
     image -> mesh -> FEM pipeline with every hole intact.
@@ -298,8 +299,41 @@ def silhouette_png(tess, out_px=1500):
     # MIN_OUT_PX floors genuinely tiny parts. A 40 mm bracket climbs back above
     # 5 px/mm, but on a 520 px raster instead of a 1500 px one -- and it is
     # raster AREA times disk radius that hurts, so it stays cheap anyway.
-    TARGET_PPM = 5.0
+    # The cap above is a POCKETING cost, not a geometry one.
+    #
+    # Everything it measures -- the morphological disks, the 65 px fillet
+    # radius, the 3.7 GiB peaks -- happens in the pocketing engine, which
+    # works in pixels. With pocketing off none of it runs, and the only thing
+    # the raster still decides is how well a curved edge survives being traced
+    # back out of it. Holding 5 px/mm there costs accuracy for a saving
+    # nobody collects: benchmarked on a curved beam, a STEP at 5 px/mm read
+    # +22.0% against Winkler-Bach, worse than the same part uploaded as a
+    # large picture, because the arc was being polygonised off a 648 px
+    # silhouette.
+    #
+    # So the caller passes what it needs. Pocketing keeps 5; plain stress
+    # analysis asks for more.
+    TARGET_PPM = float(target_ppm or 5.0)
     MIN_OUT_PX = 520
+    if target_ppm:
+        # A density on its own is not a budget.
+        #
+        # Raising px/mm fixes small parts and breaks large ones: at 16 px/mm a
+        # 420 x 180 mm plate rasterises to 6770 x 2934 -- 19.9 megapixels --
+        # and the analyse call peaked at 1579 MB against 753 MB at 5 px/mm.
+        # On a 2 GiB container that is the same OOM the original cap was
+        # written to stop, just approached from the other end: it arrives as a
+        # 503 with an empty body and nothing to read.
+        #
+        # So the ceiling is on AREA, which is what actually costs. Measured
+        # roughly 750 MB fixed plus 42 MB per megapixel, so 8 Mpx keeps the
+        # whole call near 1.1 GB. Small parts never reach it and keep the full
+        # density; a 420 mm plate lands at 10.3 px/mm, still twice what it had.
+        MAX_MPX = 8.0
+        area_mm2 = float(span2[0]) * float(span2[1]) or 1.0
+        ppm_cap = math.sqrt(MAX_MPX * 1e6 / area_mm2)
+        TARGET_PPM = min(TARGET_PPM, ppm_cap)
+        out_px = max(out_px, int(span2.max() * TARGET_PPM + 2 * pad))
     out_px = int(np.clip(float(span2.max()) * TARGET_PPM + 2 * pad,
                          MIN_OUT_PX, out_px))
 

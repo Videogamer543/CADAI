@@ -122,6 +122,10 @@
   .pkMode.on[data-m="fixed"]{border-color:#7dd3fc;color:#7dd3fc;background:#0e1b22}
   .pkMode.on[data-m="load"]{border-color:#ffd166;color:#ffd166;background:#201c0d}
   .pkMode.on[data-m="off"]{border-color:var(--edge);background:#242424}
+  .pkDir{flex:1;padding:5px 2px;border:1px solid var(--line2);border-radius:6px;
+    background:var(--raise);color:var(--txt);font-size:.78rem;cursor:pointer;line-height:1}
+  .pkDir:hover{border-color:var(--edge)}
+  .pkDir.on{border-color:#ffd166;color:#ffd166;background:#201c0d}
   #ctxOut{font-size:.63rem;line-height:1.5;color:var(--dim);margin-top:6px}
   #ctxOut .hit{color:var(--hi);font-weight:600}#ctxOut .guess{color:var(--dim2)}
   /* stress-map overlays: the key in the corner and the hover readout */
@@ -324,6 +328,28 @@
       <button class="pkMode on" data-m="off"  onclick="setPickMode('off')">Off</button>
       <button class="pkMode"    data-m="fixed" onclick="setPickMode('fixed')">Supported</button>
       <button class="pkMode"    data-m="load"  onclick="setPickMode('load')">Bears load</button>
+    </div>
+    <!-- Load type and direction, SolidWorks-style: pick the kind of load here
+         FIRST, then click the feature. The setting travels with each point as
+         it is placed, so a part can carry a downward pull on one hole and a
+         sideways one on another -- which the load case alone cannot say.
+
+         It lives in the panel rather than in a popup on the model because a
+         dialog over the part covers the hole you just clicked, and because
+         that is where every CAD package puts it. -->
+    <div id="pickLoadOpts" style="display:none;margin-top:7px">
+      <label style="font-size:.62rem">Load direction</label>
+      <div style="display:flex;gap:4px;margin:3px 0 6px">
+        <button class="pkDir on" data-d="down"  onclick="setPickDir('down')"  title="Downward">↓</button>
+        <button class="pkDir"    data-d="up"    onclick="setPickDir('up')"    title="Upward">↑</button>
+        <button class="pkDir"    data-d="left"  onclick="setPickDir('left')"  title="To the left">←</button>
+        <button class="pkDir"    data-d="right" onclick="setPickDir('right')" title="To the right">→</button>
+        <button class="pkDir"    data-d="out"   onclick="setPickDir('out')"   title="Pressure, outward along the surface normal">⊙</button>
+        <button class="pkDir"    data-d="twist" onclick="setPickDir('twist')" title="Torque about this feature">⟳</button>
+      </div>
+      <label style="font-size:.62rem" id="pickMagLbl">Force on each point (N)</label>
+      <input type="number" id="pickMag" value="500" step="10" style="width:100%;margin-top:3px">
+      <div id="pickMagNote" style="font-size:.6rem;color:#737373;margin-top:4px;line-height:1.4"></div>
     </div>
     <div id="pickHint" style="font-size:.62rem;color:#737373;margin:5px 0 0;line-height:1.45">
       Works on the stress map, the pocketing view and the 3D solid. Anything
@@ -1797,8 +1823,22 @@ const CASE_TEXT={cantilever:'Cantilever — fixed one end, load at free end',
    the same pixel space, so a point placed on one shows on the other. The 3D
    solid keeps its own list in millimetres, because a point on a solid has a
    third coordinate and the flat views have no opinion about it.            */
-let PICKS = [], PICKS3D = [], pickMode = 'off';
+let PICKS = [], PICKS3D = [], pickMode = 'off', pickDir = 'down';
 const LOAD_UNIT = {bending: 'N·m', torque: 'N·m'};
+
+/* What each direction button means, and what the magnitude box is measuring
+   when it is chosen. The unit changes with the kind of load because a force,
+   a moment and a pressure are three different quantities -- 200 of each are
+   nothing like each other, and a box that just says "load" invites one to be
+   typed for another. */
+const DIRS = {
+  down:  {v: [0,  1], unit: 'N',   lbl: 'Force on each point (N)'},
+  up:    {v: [0, -1], unit: 'N',   lbl: 'Force on each point (N)'},
+  left:  {v: [-1, 0], unit: 'N',   lbl: 'Force on each point (N)'},
+  right: {v: [1,  0], unit: 'N',   lbl: 'Force on each point (N)'},
+  out:   {v: null,    unit: 'MPa', lbl: 'Pressure on the surface (MPa)'},
+  twist: {v: null,    unit: 'N·m', lbl: 'Torque about each point (N·m)'}
+};
 
 function loadUnitLabel(){
   const u = LOAD_UNIT[$('loadCase').value] || 'N';
@@ -1809,6 +1849,9 @@ function setPickMode(m){
   pickMode = m;
   for(const b of document.querySelectorAll('.pkMode'))
     b.classList.toggle('on', b.dataset.m === m);
+  const opts = $('pickLoadOpts');
+  if(opts) opts.style.display = (m === 'load') ? '' : 'none';
+  syncDirUI();
   const cur = (m === 'off') ? '' : 'crosshair';
   $('cv').style.cursor = cur;
   $('cvp').style.cursor = cur;
@@ -1831,6 +1874,40 @@ function flatScale(cv){
   if(!lastData || !lastData.image_size) return 1;
   const w = lastData.image_size[0] || 1;
   return (cv.width || w) / w;
+}
+
+function setPickDir(d){
+  pickDir = d;
+  syncDirUI();
+}
+
+function syncDirUI(){
+  for(const b of document.querySelectorAll('.pkDir'))
+    b.classList.toggle('on', b.dataset.d === pickDir);
+  const spec = DIRS[pickDir] || DIRS.down;
+  const lbl = $('pickMagLbl'); if(lbl) lbl.textContent = spec.lbl;
+  const note = $('pickMagNote');
+  if(note) note.textContent = (pickDir === 'out')
+    ? 'Pushes outward on the wall of the hole you click — the model for a '
+      + 'pressurised bore or a press fit.'
+    : (pickDir === 'twist')
+      ? 'A pure couple about the feature. No net force, so it twists the part '
+        + 'without pushing it.'
+      : 'Applied to every point you place with this direction selected.';
+}
+
+/* What a placed point carries. Read at placement, not at solve time, so the
+   setting can be changed between clicks and each point keeps what it was
+   given -- which is the whole reason this exists rather than one direction
+   for the whole part. */
+function loadSpec(){
+  const mag = Math.abs(parseFloat($('pickMag').value) || 0);
+  const spec = DIRS[pickDir] || DIRS.down;
+  const out = {dir: pickDir, fx: 0, fy: 0, torque: 0, pressure: 0};
+  if(pickDir === 'twist') out.torque = mag;
+  else if(pickDir === 'out') out.pressure = mag * 1e6;   // MPa -> Pa
+  else { out.fx = spec.v[0] * mag; out.fy = spec.v[1] * mag; }
+  return out;
 }
 
 function partXY(cv, e){
@@ -1886,7 +1963,9 @@ function flatClick(cv, e){
     setStatusHint('Click on the part — a hole or an edge. Nothing there.');
     return;
   }
-  PICKS.push({role: pickMode, x: f.x, y: f.y, r: f.r, label: f.label});
+  PICKS.push(Object.assign({role: pickMode, x: f.x, y: f.y, r: f.r,
+                            label: f.label},
+                           pickMode === 'load' ? loadSpec() : {}));
   afterPickChange();
 }
 
@@ -1957,7 +2036,8 @@ function solidClick(e){
       PICKS3D.splice(i, 1); afterPickChange(); return;
     }
   }
-  PICKS3D.push({role: pickMode, x: p[0], y: p[1], z: p[2], r: r});
+  PICKS3D.push(Object.assign({role: pickMode, x: p[0], y: p[1], z: p[2], r: r},
+                             pickMode === 'load' ? loadSpec() : {}));
   afterPickChange();
 }
 
@@ -1991,15 +2071,30 @@ function renderPickList(){
       + 'Nothing placed — the load case above is being used.</span>';
     return;
   }
-  const held = PICKS.filter(p => p.role === 'fixed').length
-             + PICKS3D.filter(p => p.role === 'fixed').length;
-  const loaded = n - held;
-  const each = loaded ? (parseFloat($('load').value) || 0) / loaded : 0;
+  const all = PICKS.concat(PICKS3D);
+  const held = all.filter(p => p.role === 'fixed').length;
+  const loads = all.filter(p => p.role === 'load');
+  // Group the loads by what they actually are. One line per kind beats one
+  // total, because the whole point of the direction picker is that two
+  // points can carry different things, and a single "4 loaded" would hide
+  // exactly the distinction it exists to make.
+  const kinds = {};
+  for(const p of loads){
+    let k;
+    if(p.pressure) k = (p.pressure / 1e6).toFixed(1) + ' MPa pressure';
+    else if(p.torque) k = p.torque.toFixed(0) + ' N·m torque';
+    else {
+      const m = Math.hypot(p.fx || 0, p.fy || 0);
+      const nm = {down: '↓', up: '↑', left: '←', right: '→'}[p.dir] || '';
+      k = m.toFixed(0) + ' N ' + nm;
+    }
+    kinds[k] = (kinds[k] || 0) + 1;
+  }
   const bits = [];
   if(held) bits.push(held + ' point' + (held > 1 ? 's' : '') + ' held');
-  if(loaded) bits.push(loaded + ' loaded, ' + each.toFixed(0) + ' '
-                       + (LOAD_UNIT[$('loadCase').value] || 'N') + ' each');
-  el.innerHTML = '<div style="font-size:.64rem;color:#a3a3a3">'
+  for(const k in kinds) bits.push(kinds[k] + ' × ' + k);
+  const loaded = loads.length;
+  el.innerHTML = '<div style="font-size:.64rem;color:#a3a3a3;line-height:1.6">'
     + esc(bits.join(' · ')) + '</div>'
     + (loaded && !held ? '<div style="font-size:.6rem;color:#e5a0a0;'
         + 'margin-top:4px">Nothing is holding the part — add a support, or '
@@ -2014,27 +2109,61 @@ function renderPickList(){
 function drawPicks(ctx, s, k){
   k = k || 1;
   for(const p of PICKS)
-    pickGlyph(ctx, p.x * k, p.y * k, p.r * k, p.role, s);
+    pickGlyph(ctx, p.x * k, p.y * k, p.r * k, p.role, s, p);
 }
 
-function pickGlyph(ctx, x, y, r, role, s){
+/* The arrow points where the force actually points.
+   A glyph that always drew downward would be decoration: the reader could not
+   tell a sideways pull from a downward one, which is precisely what the
+   direction picker exists to let them say. Pressure and torque get their own
+   marks, since neither has a single direction to draw. */
+function pickGlyph(ctx, x, y, r, role, s, p){
   const held = role === 'fixed';
   ctx.save();
   ctx.lineWidth = Math.max(1.5, 2 * s);
   ctx.strokeStyle = held ? '#7dd3fc' : '#ffd166';
+  ctx.fillStyle = '#ffd166';
   ctx.beginPath(); ctx.arc(x, y, r, 0, 6.2832); ctx.stroke();
   if(held){
     for(let k = -2; k <= 2; k++){
       const a = x + k * r * 0.45, b = y + r;
       ctx.beginPath(); ctx.moveTo(a, b); ctx.lineTo(a - 5 * s, b + 6 * s); ctx.stroke();
     }
+    ctx.restore(); return;
+  }
+  const d = (p && p.dir) || 'down';
+  if(d === 'out'){
+    // Pressure: short arrows radiating outward off the rim.
+    for(let i = 0; i < 8; i++){
+      const a = i * Math.PI / 4;
+      const cx = x + Math.cos(a) * r * 0.55, cy = y + Math.sin(a) * r * 0.55;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(x + Math.cos(a) * r * 1.15, y + Math.sin(a) * r * 1.15);
+      ctx.stroke();
+    }
+  }else if(d === 'twist'){
+    ctx.beginPath(); ctx.arc(x, y, r * 0.62, 0.5, 5.1); ctx.stroke();
+    const a = 5.1, ex = x + r * 0.62 * Math.cos(a), ey = y + r * 0.62 * Math.sin(a);
+    ctx.beginPath(); ctx.moveTo(ex, ey);
+    ctx.lineTo(ex - 5 * s, ey - 6 * s); ctx.lineTo(ex + 6 * s, ey - 3 * s);
+    ctx.closePath(); ctx.fill();
   }else{
-    ctx.beginPath(); ctx.moveTo(x, y - r * 1.9); ctx.lineTo(x, y + r * 0.4); ctx.stroke();
+    const v = {down: [0, 1], up: [0, -1], left: [-1, 0], right: [1, 0]}[d]
+              || [0, 1];
+    const ux = v[0], uy = v[1];
+    // Tail behind the feature, head just inside it, so the arrow reads as
+    // "the force arrives here" rather than "something is over there".
     ctx.beginPath();
-    ctx.moveTo(x, y + r * 0.5);
-    ctx.lineTo(x - 4.5 * s, y + r * 0.5 - 7 * s);
-    ctx.lineTo(x + 4.5 * s, y + r * 0.5 - 7 * s);
-    ctx.closePath(); ctx.fillStyle = '#ffd166'; ctx.fill();
+    ctx.moveTo(x - ux * r * 1.9, y - uy * r * 1.9);
+    ctx.lineTo(x - ux * r * 0.1, y - uy * r * 0.1);
+    ctx.stroke();
+    const hx = x - ux * r * 0.1, hy = y - uy * r * 0.1;
+    ctx.beginPath();
+    ctx.moveTo(hx, hy);
+    ctx.lineTo(hx - ux * 8 * s - uy * 4.5 * s, hy - uy * 8 * s + ux * 4.5 * s);
+    ctx.lineTo(hx - ux * 8 * s + uy * 4.5 * s, hy - uy * 8 * s - ux * 4.5 * s);
+    ctx.closePath(); ctx.fill();
   }
   ctx.restore();
 }
@@ -2067,11 +2196,15 @@ function drawPicks3d(ctx, rot, S){
 }
 
 function picksForPost(){
-  return PICKS.map(p => ({role: p.role, x: p.x, y: p.y, r: p.r,
-                          label: p.label}));
+  return PICKS.map(p => ({role: p.role, x: p.x, y: p.y, r: p.r, label: p.label,
+                          fx: p.fx || 0, fy: p.fy || 0,
+                          torque: p.torque || 0, pressure: p.pressure || 0}));
 }
 function picks3dForPost(){
-  return PICKS3D.map(p => ({role: p.role, x: p.x, y: p.y, z: p.z, r: p.r}));
+  return PICKS3D.map(p => ({role: p.role, x: p.x, y: p.y, z: p.z, r: p.r,
+                            fx: p.fx || 0, fy: p.fy || 0, fz: p.fz || 0,
+                            torque: p.torque || 0,
+                            pressure: p.pressure || 0}));
 }
 
 function initPicks(){
@@ -2080,7 +2213,8 @@ function initPicks(){
   $('cv3d').addEventListener('click', solidClick);
   $('loadCase').addEventListener('change', loadUnitLabel);
   $('load').addEventListener('input', renderPickList);
-  loadUnitLabel(); renderPickList();
+  $('pickMag').addEventListener('input', renderPickList);
+  loadUnitLabel(); syncDirUI(); renderPickList();
 }
 
 

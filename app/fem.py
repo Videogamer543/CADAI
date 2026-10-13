@@ -41,7 +41,29 @@ from skfem.helpers import ddot, sym_grad, trace
 # Colour-scale reference percentile. 98 keeps a real hot spot red while
 # refusing to let one singular node at the clamp own the whole scale.
 REF_PCTL = 98.0
-# Percentile used for the *reported* peak / safety factor.
+# A boundary node whose material wedge exceeds this multiple of pi is a
+# re-entrant corner, where linear elasticity gives unbounded stress. The exact
+# value does not matter -- a true 270-degree corner reads 1.5, a straight edge
+# reads 1.0, and nothing real sits between -- which was confirmed by sweeping
+# it: 1.12, 1.25 and 1.35 give byte-identical results.
+REENTRANT_WEDGE = 1.25
+# How far from such a corner to stop reading, as a fraction of the span.
+#
+# This one DOES matter, because the field is still steep near a singularity
+# and the reported peak is whatever survives just outside the exclusion.
+# Measured on an L-bracket across a 4x range of element size:
+#
+#     radius      reported peak (MPa)        spread
+#     0.025      35.9  36.9  43.9  40.8      22.2%
+#     0.040      35.9  34.4  35.4  36.2       5.5%
+#     0.060      32.4  32.6  32.4  32.2       1.0%
+#
+# 0.04 is the knee: it buys most of the stability for a fraction of the
+# material thrown away. A plate with a hole reads 80.3/80.1/80.4 at every one
+# of them, because a hole rim is not re-entrant and is never excluded.
+REENTRANT_R = 0.04
+# Percentile used for the COLOUR SCALE only; see REF_PCTL above. The reported
+# peak is no longer a percentile -- see where peak_clean is computed.
 PEAK_PCTL = 99.5
 
 
@@ -164,6 +186,45 @@ def _facet_loops(m):
 
     loops.sort(key=extent, reverse=True)
     return loops
+
+
+def _wedge_angles(points_m, tris, N):
+    """Total material angle at every node, in radians.
+
+    The sum of the triangle corner angles meeting at a node. An interior node
+    reads 2*pi; a node on a straight edge reads pi; the corner of a rectangle
+    reads pi/2; the inside corner of an L reads 3*pi/2.
+
+    This is how a genuine singularity can be told from a genuine stress
+    concentration without refining the mesh twice. Both are small hot
+    regions, but one is a property of the part and one is a property of the
+    idealisation: elasticity gives unbounded stress wherever the material
+    wedge exceeds pi, and nowhere else. A hole rim is a smooth boundary
+    reading pi, so its concentration is finite, converged and real; a
+    re-entrant corner reads more than pi and its "peak" is whatever the mesh
+    last happened to resolve.
+
+    Measured off the mesh rather than the outline on purpose -- it needs no
+    loop orientation, works the same on an outer boundary and a bore, and
+    cannot disagree with the elements the solve actually used.
+    """
+    p = np.asarray(points_m, float)
+    t = np.asarray(tris, np.int64)
+    ang = np.zeros(N)
+    for k in range(3):
+        i = t[:, k]
+        j = t[:, (k + 1) % 3]
+        m = t[:, (k + 2) % 3]
+        u = p[j] - p[i]
+        v = p[m] - p[i]
+        nu = np.linalg.norm(u, axis=1)
+        nv = np.linalg.norm(v, axis=1)
+        good = (nu > 0) & (nv > 0)
+        c = np.zeros(len(i))
+        c[good] = np.clip((u[good] * v[good]).sum(axis=1)
+                          / (nu[good] * nv[good]), -1.0, 1.0)
+        np.add.at(ang, i, np.arccos(c))
+    return ang
 
 
 def _nodal_areas(points_m, tris, N):
@@ -1070,6 +1131,53 @@ def solve_plane_stress(points, tris, E=69e9, nu=0.33, thickness=0.00635,
     if vm_node.size < N:                       # paranoia: pad, never crash
         vm_node = np.pad(vm_node, (0, N - vm_node.size))
 
+    # ---- the individual components, projected the same way ---------------
+    #
+    # von Mises is a scalar summary and it is the right thing to PAINT, but it
+    # is the wrong thing to CHECK against a textbook. Every closed-form result
+    # in mechanics names a component: Mc/I is sigma_xx, Winkler-Bach is
+    # sigma_theta, Lame gives sigma_r and sigma_theta separately. Comparing von
+    # Mises to any of them happens to work where one component dominates and
+    # quietly does not elsewhere -- near a cantilever's neutral axis the
+    # bending stress passes through zero while von Mises does not, because
+    # shear is carrying the section there.
+    #
+    # Signs survive, which is the other half of the point: a curved beam in
+    # bending is in tension on one fibre and compression on the other, and a
+    # magnitude cannot tell you which.
+    def _project(field):
+        """Quadrature-point field -> nodal values, by L2 projection."""
+        try:
+            @LinearForm
+            def _rhs(v, w):
+                return w["q"] * v
+            out = spsolve(M.tocsr(), asm(_rhs, sbasis, q=field))
+            out = np.nan_to_num(np.asarray(out, float).ravel()[:N],
+                                nan=0.0, posinf=0.0, neginf=0.0)
+            if out.size < N:
+                out = np.pad(out, (0, N - out.size))
+            # Clamp to the range the data actually spans. The projection can
+            # ring past it at a re-entrant corner, and a component that
+            # overshoots its own quadrature values is an artefact of the fit.
+            return np.clip(out, float(field.min()), float(field.max()))
+        except Exception:
+            cnt = np.zeros(N)
+            acc = np.zeros(N)
+            cell = field.mean(axis=1) if field.size else np.zeros(len(tris))
+            for ti, t in enumerate(np.asarray(tris)):
+                for n_ in t:
+                    acc[n_] += cell[ti]
+                    cnt[n_] += 1
+            cnt[cnt == 0] = 1
+            return acc / cnt
+
+    try:
+        sxx_node = _project(sxx)
+        syy_node = _project(syy)
+        sxy_node = _project(sxy)
+    except Exception:
+        sxx_node = syy_node = sxy_node = np.zeros(N)
+
     # ---- colour-scale reference ----------------------------------------
     # Stress at a clamped edge is singular in linear elasticity: it rises
     # without limit as the mesh refines, so it is a meaningless number to
@@ -1121,6 +1229,44 @@ def solve_plane_stress(points, tris, E=69e9, nu=0.33, thickness=0.00635,
         r_ld = float(np.clip(max(lw, 0.03 * span), 0.02 * span, 0.08 * span))
         collar |= _ball(load_nodes, r_ld)
 
+    # Re-entrant corners, and any node held by a single pin.
+    #
+    # These are the other two places the field is singular, and neither is
+    # anywhere near the supports, so the Saint-Venant collar above misses
+    # both. Until they were excluded the reported peak had to be an area
+    # percentile to stay stable -- and that percentile is what made the app
+    # report 35.8 MPa for a plate whose hole rim genuinely reaches 78.3. A
+    # stress concentration is localised by definition, so it occupies far
+    # less than the top half-percent of a plate's AREA and an area percentile
+    # steps straight over it. Excluding the singularities by geometry instead
+    # lets the honest maximum be reported.
+    try:
+        wedge = _wedge_angles(points_m, np.asarray(tris), N)
+        # BOUNDARY nodes only. An interior node is surrounded by material and
+        # reads 2*pi by construction, so testing the whole array against pi
+        # marks the entire inside of the part as re-entrant -- the collar then
+        # covers everything, trips the "collar ate the part" guard, and
+        # switches itself off completely. That is what the first version did,
+        # and the symptom was the L-bracket's reported peak going back to
+        # tracking the raw singular maximum with 0 nodes excluded.
+        on_edge = _boundary_nodes(np.asarray(tris), N)
+        # Beyond pi the wedge is re-entrant and the stress is unbounded. The
+        # margin keeps an ordinary straight edge, whose nodes read pi to
+        # within meshing noise, out of it.
+        reentrant = on_edge & (wedge > (np.pi * REENTRANT_WEDGE))
+        if reentrant.any():
+            collar |= _ball(reentrant, REENTRANT_R * span)
+    except Exception:
+        pass
+    if pin_picks:
+        pin_nodes = np.zeros(N, bool)
+        for q in pin_picks:
+            px_ = float(q.get("x", 0.0)) * m_per_px
+            py_ = float(q.get("y", 0.0)) * m_per_px
+            pin_nodes[int(np.argmin((points_m[:, 0] - px_) ** 2 +
+                                    (points_m[:, 1] - py_) ** 2))] = True
+        collar |= _ball(pin_nodes, 0.04 * span)
+
     keep = ~collar
     if int(keep.sum()) < max(12, int(0.05 * N)):   # collar ate the part
         keep = np.ones(N, bool)
@@ -1138,7 +1284,13 @@ def solve_plane_stress(points, tris, E=69e9, nu=0.33, thickness=0.00635,
     wts = _nodal_areas(points_m, np.asarray(tris), N)[keep]
     ref = _wpercentile(clean, wts, REF_PCTL)
     peak_true = float(vm_node.max()) if vm_node.size else 0.0
-    peak_clean = _wpercentile(clean, wts, PEAK_PCTL)
+    # The reported peak is the MAXIMUM of the non-singular field, not a
+    # percentile of it. Once the singular regions are excluded by geometry
+    # there is nothing left for a percentile to protect against, and a
+    # percentile actively hides the thing the tool exists to find: a hole's
+    # concentration is a tiny patch of area, so any area percentile reports
+    # the plate around it instead of the rim.
+    peak_clean = float(clean.max()) if clean.size else 0.0
     if ref <= 0:
         ref = peak_true
     if ref <= 0:
@@ -1210,6 +1362,11 @@ def solve_plane_stress(points, tris, E=69e9, nu=0.33, thickness=0.00635,
         "nodes": points.tolist(),
         "tris": np.asarray(tris).tolist(),
         "von_mises": vm_node.tolist(),
+        # Signed Cartesian components at the same nodes, in pascals. These are
+        # what a closed-form check needs; see _project above.
+        "sigma_xx": sxx_node.tolist(),
+        "sigma_yy": syy_node.tolist(),
+        "sigma_xy": sxy_node.tolist(),
         # shared by the stress map AND the pocketing engine
         "von_mises_norm": vm_norm.tolist(),
         # straight sigma/sigma_ref, kept for anyone who needs true ratios
