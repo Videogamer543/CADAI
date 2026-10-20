@@ -126,6 +126,13 @@
     background:var(--raise);color:var(--txt);font-size:.78rem;cursor:pointer;line-height:1}
   .pkDir:hover{border-color:var(--edge)}
   .pkDir.on{border-color:#ffd166;color:#ffd166;background:#201c0d}
+  /* Point/Face reads as neither colour: it says WHERE the condition goes, not
+     whether it holds or loads, and borrowing the blue or the amber would make
+     it look like a third kind of condition. */
+  .pkShape{flex:1;padding:5px 4px;border:1px solid var(--line2);border-radius:6px;
+    background:var(--raise);color:var(--txt);font-size:.64rem;font-weight:600;cursor:pointer}
+  .pkShape:hover{border-color:var(--edge)}
+  .pkShape.on{border-color:var(--edge);color:#e5e5e5;background:#242424}
   #ctxOut{font-size:.63rem;line-height:1.5;color:var(--dim);margin-top:6px}
   #ctxOut .hit{color:var(--hi);font-weight:600}#ctxOut .guess{color:var(--dim2)}
   /* stress-map overlays: the key in the corner and the hover readout */
@@ -322,12 +329,29 @@
          nothing else is asked. Direction and magnitude come from the load
          case and the load box that are already on this panel, and the total
          is split between however many load points there are, so two clicks
-         at 500 N is 250 N each. Click a marker again to remove it. -->
+         at 500 N is 250 N each. Click a marker to select it, drag it to move
+         it, Backspace to delete it. -->
     <label>Click the part to place</label>
     <div id="pickModes" style="display:flex;gap:5px">
       <button class="pkMode on" data-m="off"  onclick="setPickMode('off')">Off</button>
       <button class="pkMode"    data-m="fixed" onclick="setPickMode('fixed')">Supported</button>
       <button class="pkMode"    data-m="load"  onclick="setPickMode('load')">Bears load</button>
+    </div>
+    <!-- Point or whole face. A clamp is rarely a point: a bracket bolted along
+         one edge is held by the whole of that edge, and holding it at one spot
+         instead lets the rest of the edge rotate about it, which reads as
+         bending the part does not do. Face mode follows the outline out from
+         the click while it stays straight and stops at the corners, so one
+         click gets the face and not the two next to it. A bore is already a
+         face -- clicking one picks the whole wall either way. -->
+    <div id="pickShapeRow" style="display:none;margin-top:6px">
+      <label style="font-size:.62rem">Apply to</label>
+      <div style="display:flex;gap:5px;margin-top:3px">
+        <button class="pkShape on" data-s="point" onclick="setPickShape('point')"
+                title="A spot on the outline, or a whole bore">Point</button>
+        <button class="pkShape"    data-s="face"  onclick="setPickShape('face')"
+                title="The whole flat face under the cursor, corner to corner">Face</button>
+      </div>
     </div>
     <!-- Load type and direction, SolidWorks-style: pick the kind of load here
          FIRST, then click the feature. The setting travels with each point as
@@ -952,6 +976,15 @@ let panning=false;
     },{passive:false});
     el.addEventListener('mousedown',e=>{
       const z=zSt(); if(!z||z.k<=1.001)return;
+      // Grabbing a placed marker is a marker drag, not a pan. Both are the
+      // left button on the same canvas while the view is zoomed in, and
+      // panning the picture while a support slides under the cursor is
+      // unreadable, so the marker claims the gesture.
+      if(typeof pickMode!=='undefined'&&pickMode!=='off'
+         &&typeof pickHitTest==='function'){
+        const xy=partXY(el,e);
+        if(xy&&pickHitTest(xy)>=0)return;
+      }
       drag.on=true; panning=true; drag.x=e.clientX; drag.y=e.clientY;
       el.classList.add('grabbing'); $('tip').style.display='none';
       e.preventDefault();
@@ -1091,7 +1124,20 @@ function render3d(){
   // spinning the part counts as a click and drops a support wherever the
   // cursor happened to land -- which is maddening, because the part is in a
   // new position by then and the marker looks like it came from nowhere.
-  cv.addEventListener('mousedown',e=>{v3.drag=true;v3.moved=false;v3.dragged=false;v3.mode=(e.button===2||e.shiftKey)?'pan':'rot';v3.lx=e.clientX;v3.ly=e.clientY;v3.dx0=e.clientX;v3.dy0=e.clientY;cv.style.cursor=v3.mode==='pan'?'move':'grabbing';});
+  cv.addEventListener('mousedown',e=>{
+    // A marker under the cursor is dragged, not orbited past. Tested before
+    // anything else because both gestures are the left button, and whichever
+    // one is checked second never happens: grabbing a support would spin the
+    // part instead of moving the support.
+    if(typeof pickMode!=='undefined'&&pickMode!=='off'&&e.button!==2&&!e.shiftKey
+       &&typeof pick3dHitTest==='function'){
+      const i=pick3dHitTest(e);
+      if(i>=0){SEL={list:'3d',i:i};
+        PDRAG={list:'3d',i:i,x0:e.clientX,y0:e.clientY,moved:false};
+        v3.drag=false;v3.dragged=false;cv.style.cursor='move';
+        afterPickChange();return}
+    }
+    v3.drag=true;v3.moved=false;v3.dragged=false;v3.mode=(e.button===2||e.shiftKey)?'pan':'rot';v3.lx=e.clientX;v3.ly=e.clientY;v3.dx0=e.clientX;v3.dy0=e.clientY;cv.style.cursor=v3.mode==='pan'?'move':'grabbing';});
   cv.addEventListener('contextmenu',e=>e.preventDefault());
   // Repaint on release: the drag was drawn at reduced detail, so without this
   // the part would sit there at half resolution until something else moved.
@@ -1824,6 +1870,15 @@ const CASE_TEXT={cantilever:'Cantilever — fixed one end, load at free end',
    solid keeps its own list in millimetres, because a point on a solid has a
    third coordinate and the flat views have no opinion about it.            */
 let PICKS = [], PICKS3D = [], pickMode = 'off', pickDir = 'down';
+/* Point or whole face, and which marker the keyboard is talking about.
+   SEL names a list and an index rather than holding the object, because the
+   lists are spliced and a held reference would outlive its own entry -- the
+   bug where Backspace deletes something that is already gone. */
+let pickShape = 'point', SEL = null;
+/* Drag state. One object for both views: at most one marker is ever being
+   dragged, and keeping two would mean keeping them in agreement. */
+let PDRAG = null;
+let _pick3dScreen = [];     // where drawPicks3d last put each 3D marker
 const LOAD_UNIT = {bending: 'N·m', torque: 'N·m'};
 
 /* What each direction button means, and what the magnitude box is measuring
@@ -1851,6 +1906,9 @@ function setPickMode(m){
     b.classList.toggle('on', b.dataset.m === m);
   const opts = $('pickLoadOpts');
   if(opts) opts.style.display = (m === 'load') ? '' : 'none';
+  const shp = $('pickShapeRow');
+  if(shp) shp.style.display = (m === 'off') ? 'none' : '';
+  if(m === 'off') SEL = null;
   syncDirUI();
   const cur = (m === 'off') ? '' : 'crosshair';
   $('cv').style.cursor = cur;
@@ -1879,6 +1937,13 @@ function flatScale(cv){
 function setPickDir(d){
   pickDir = d;
   syncDirUI();
+}
+
+function setPickShape(s){
+  pickShape = s;
+  for(const b of document.querySelectorAll('.pkShape'))
+    b.classList.toggle('on', b.dataset.s === s);
+  renderPickList();
 }
 
 function syncDirUI(){
@@ -1948,24 +2013,196 @@ function snapTo(d, x, y){
   return {x: n[bi][0], y: n[bi][1], r: Math.max(sz * 0.05, 6), label: 'edge'};
 }
 
-function flatClick(cv, e){
+/* The whole flat face under the cursor, corner to corner.
+
+   A point is the wrong thing to clamp with. A bracket bolted along one edge is
+   held by the whole of that edge; holding it at one spot instead leaves the
+   rest of the edge free to rotate about it, and the answer comes back bent in
+   a way the real part is not. So: find the nearest piece of outline, then walk
+   it outward in both directions for as long as it stays on the same straight
+   line, and stop where it turns.
+
+   Straightness is judged by distance from a line, not by the angle between
+   consecutive edges, because the outline of an uploaded picture is traced off
+   a raster and a perfectly straight face still arrives as a staircase -- its
+   little edges sit at 45 degrees to each other while the face itself does not
+   deviate by more than a pixel. Perpendicular distance sees through that; an
+   edge-to-edge angle test stops dead on the first step.
+
+   The direction is fitted twice. The first guess comes from the two nodes
+   either side of the click, which is noisy on a staircase and plainly wrong if
+   a corner happens to fall inside that window, and the second comes from the
+   span the first pass actually found. Two passes is enough: the second guess is
+   drawn from tens of nodes instead of two. */
+function faceAt(d, x, y){
+  const n = d.nodes || [];
+  const sz = Math.min(d.image_size[0], d.image_size[1]);
+  let loop = null, at = -1, bd = 1e9;
+  for(const L of (boundaryLoops(d) || []))
+    for(let j = 0; j < L.length; j++){
+      const dist = Math.hypot(x - n[L[j]][0], y - n[L[j]][1]);
+      if(dist < bd){bd = dist; loop = L; at = j}
+    }
+  if(!loop || bd > sz * 0.09) return null;
+  const M = loop.length;
+  const P = j => n[loop[((j % M) + M) % M]];
+  // How far off the line a node may sit and still count as on the face. Scaled
+  // to the part so it means the same thing on a 40 mm bracket as on a 400 mm
+  // plate, with a floor of two pixels for the raster's own staircase.
+  const tol = Math.max(sz * 0.004, 2);
+
+  function walk(ox, oy, ux, uy){
+    const span = dir => {
+      let j = at;
+      for(let k = 1; k < M; k++){
+        const q = P(at + dir * k);
+        const px = q[0] - ox, py = q[1] - oy;
+        if(Math.abs(px * -uy + py * ux) > tol) break;
+        j = at + dir * k;
+      }
+      return j;
+    };
+    return [span(-1), span(1)];
+  }
+
+  const p0 = P(at - 1), p1 = P(at + 1);
+  let vx = p1[0] - p0[0], vy = p1[1] - p0[1];
+  let len = Math.hypot(vx, vy) || 1;
+  let [ja, jb] = walk(P(at)[0], P(at)[1], vx / len, vy / len);
+  let a = P(ja), b = P(jb);
+  if(Math.hypot(b[0] - a[0], b[1] - a[1]) > 4 * tol){
+    vx = b[0] - a[0]; vy = b[1] - a[1];
+    len = Math.hypot(vx, vy) || 1;
+    [ja, jb] = walk((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, vx / len, vy / len);
+    a = P(ja); b = P(jb);
+  }
+  const L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+  // Too short to be a face. Saying so and letting the caller place a point is
+  // better than selecting three pixels of outline and calling it a surface --
+  // the user would see a marker and believe the face was taken.
+  if(L < Math.max(sz * 0.03, 10)) return null;
+  // The band is as wide as the face is actually crooked. A clean STEP edge
+  // gets a hairline, a traced raster gets a few pixels, and neither is a
+  // number anyone has to know about. Capped so it can never reach across a
+  // thin rib to the face on the other side.
+  let dev = 0;
+  vx = (b[0] - a[0]) / L; vy = (b[1] - a[1]) / L;
+  for(let j = ja; j <= jb; j++){
+    const q = P(j);
+    dev = Math.max(dev, Math.abs((q[0] - a[0]) * -vy + (q[1] - a[1]) * vx));
+  }
+  const band = Math.min(Math.max(dev * 1.6, 2.5), sz * 0.015);
+  return {shape: 'span', x0: a[0], y0: a[1], x1: b[0], y1: b[1],
+          x: (a[0] + b[0]) / 2, y: (a[1] + b[1]) / 2, r: band,
+          label: 'face ' + (L / (d.px_per_mm || 1)).toFixed(1) + ' mm'};
+}
+
+/* What a click turns into, on either flat view.
+   In face mode a bore is still taken whole, because a bore already IS a face:
+   the disc round it covers its entire wall, and walking a circle for
+   straightness would find a few degrees of it and miss the point. */
+function makeFlatPick(d, x, y){
+  if(pickShape === 'face'){
+    for(const h of (d.hole_stress || []))
+      if(Math.hypot(x - h.x, y - h.y) <= h.r * 1.7) return snapTo(d, x, y);
+    const f = faceAt(d, x, y);
+    if(f) return f;
+  }
+  return snapTo(d, x, y);
+}
+
+/* How far a cursor is from a placed marker. A point measures to its centre; a
+   face measures to its segment, so grabbing a selected face anywhere along it
+   works, which is the only sane way to pick up something 80 mm long. */
+function distToPick(p, x, y){
+  if(p.shape === 'span'){
+    const ex = p.x1 - p.x0, ey = p.y1 - p.y0, ll = ex * ex + ey * ey;
+    let t = ll ? ((x - p.x0) * ex + (y - p.y0) * ey) / ll : 0;
+    t = Math.max(0, Math.min(1, t));
+    return Math.hypot(x - (p.x0 + t * ex), y - (p.y0 + t * ey));
+  }
+  return Math.hypot(x - p.x, y - p.y);
+}
+
+/* Which marker is under the cursor, latest first, so a point dropped on top of
+   an earlier one is the one that answers. */
+function pickHitTest(xy){
+  for(let i = PICKS.length - 1; i >= 0; i--)
+    if(distToPick(PICKS[i], xy[0], xy[1]) <= Math.max(PICKS[i].r * 1.2, 7))
+      return i;
+  return -1;
+}
+
+let _suppressClick = false;
+
+function flatDown(cv, e){
   if(pickMode === 'off' || !lastData) return;
   const xy = partXY(cv, e); if(!xy) return;
-  // A click on something already placed removes it. One gesture, both ways --
-  // nothing to select first and no delete button to find.
-  for(let i = 0; i < PICKS.length; i++){
-    if(Math.hypot(xy[0] - PICKS[i].x, xy[1] - PICKS[i].y) <= PICKS[i].r * 1.2){
-      PICKS.splice(i, 1); afterPickChange(); return;
-    }
-  }
-  const f = snapTo(lastData, xy[0], xy[1]);
-  if(!f){
-    setStatusHint('Click on the part — a hole or an edge. Nothing there.');
+  const i = pickHitTest(xy);
+  if(i < 0) return;                      // empty space: the click will place
+  SEL = {list: '2d', i: i};
+  PDRAG = {list: '2d', i: i, cv: cv, x0: e.clientX, y0: e.clientY,
+           moved: false};
+  afterPickChange();
+}
+
+/* Dragging re-snaps rather than translating.
+   Moving a marker by the cursor's delta would let it drift off the outline,
+   and a condition off the outline is carried by no facet at all -- it would
+   look placed and do nothing. Re-snapping means the marker follows the cursor
+   along the boundary and lands on something real at every step. */
+function flatMove(e){
+  if(!PDRAG || PDRAG.list !== '2d') return;
+  if(Math.abs(e.clientX - PDRAG.x0) > 3 || Math.abs(e.clientY - PDRAG.y0) > 3)
+    PDRAG.moved = true;
+  if(!PDRAG.moved) return;
+  const p = PICKS[PDRAG.i];
+  if(!p){PDRAG = null; return}
+  const xy = partXY(PDRAG.cv, e); if(!xy) return;
+  const f = makeFlatPick(lastData, xy[0], xy[1]);
+  if(!f) return;                   // cursor off the part: leave it put
+  // Replace WHERE it is, keep WHAT it is. The role, the direction and the
+  // magnitude were chosen when it was placed and dragging is not a request to
+  // reconsider any of them.
+  for(const k of ['shape', 'x', 'y', 'r', 'x0', 'y0', 'x1', 'y1', 'label'])
+    delete p[k];
+  Object.assign(p, f);
+  afterPickChange();
+}
+
+function flatUp(){
+  if(!PDRAG || PDRAG.list !== '2d') return;
+  // A drag ends over whatever it ends over, and the browser sends a click
+  // after it. Swallow that one, or letting go of a marker would also count as
+  // clicking it.
+  if(PDRAG.moved) _suppressClick = true;
+  PDRAG = null;
+}
+
+function flatClick(cv, e){
+  if(_suppressClick){_suppressClick = false; return}
+  if(pickMode === 'off' || !lastData) return;
+  const xy = partXY(cv, e); if(!xy) return;
+  const i = pickHitTest(xy);
+  if(i >= 0){
+    // Select, not delete. Clicking to delete was fine when a click was the
+    // only gesture; with dragging on the same button, every drag that fell
+    // short of the slop threshold would silently throw the marker away.
+    SEL = {list: '2d', i: i};
+    setStatusHint('Selected. Drag to move it, Backspace to delete it.');
+    afterPickChange();
     return;
   }
-  PICKS.push(Object.assign({role: pickMode, x: f.x, y: f.y, r: f.r,
-                            label: f.label},
+  const f = makeFlatPick(lastData, xy[0], xy[1]);
+  if(!f){
+    setStatusHint(pickShape === 'face'
+      ? 'No face there — click along an edge of the part, or a hole.'
+      : 'Click on the part — a hole or an edge. Nothing there.');
+    return;
+  }
+  PICKS.push(Object.assign({role: pickMode}, f,
                            pickMode === 'load' ? loadSpec() : {}));
+  SEL = {list: '2d', i: PICKS.length - 1};
   afterPickChange();
 }
 
@@ -1978,7 +2215,10 @@ function flatClick(cv, e){
    Nearest, not first: the facets are drawn back-to-front, so without the
    depth test a click on the front of a part would land on the back of it --
    and on a plate the two are a few millimetres apart and the wrong one is
-   the far face of the same hole. */
+   the far face of the same hole.
+
+   Returns the facet's centroid AND its index: the centroid is what a point
+   pick needs, and the index is where a face selection starts growing from. */
 function pick3dAt(e){
   const src = solid3d || mesh3d; if(!src) return null;
   const cv = $('cv3d'), b = cv.getBoundingClientRect();
@@ -1996,7 +2236,8 @@ function pick3dAt(e){
   const sc = Math.min(W, H) * 0.7 * v3.zoom, ox = W/2 + v3.panX, oy = H/2 + v3.panY;
   const S = q => [q[0]*sc + ox, -q[1]*sc + oy];
   let best = null, bz = -1e9;
-  for(const t of tris){
+  for(let ti = 0; ti < tris.length; ti++){
+    const t = tris[ti];
     const P = verts ? [verts[t[0]], verts[t[1]], verts[t[2]]] : t;
     const r0 = rot(P[0]), r1 = rot(P[1]), r2 = rot(P[2]);
     const a = S(r0), c = S(r1), g = S(r2);
@@ -2013,37 +2254,247 @@ function pick3dAt(e){
     const z = (r0[2] + r1[2] + r2[2]) / 3;
     if(z > bz){
       bz = z;
-      best = [(P[0][0]+P[1][0]+P[2][0])/3, (P[0][1]+P[1][1]+P[2][1])/3,
-              (P[0][2]+P[1][2]+P[2][2])/3];
+      best = {ti: ti,
+              p: [(P[0][0]+P[1][0]+P[2][0])/3, (P[0][1]+P[1][1]+P[2][1])/3,
+                  (P[0][2]+P[1][2]+P[2][2])/3]};
     }
   }
   return best;
 }
 
-function solidClick(e){
-  if(pickMode === 'off' || v3.dragged) return;
-  const src = solid3d || mesh3d; if(!src) return;
-  const p = pick3dAt(e);
-  if(!p){setStatusHint('Click on the solid itself.'); return}
-  // One capture radius for every pick, scaled to the part. A sphere on a
-  // tessellated surface is a blunt instrument, and sizing it per click would
-  // mean guessing at a feature the viewer cannot see -- the solver holds a
-  // different mesh from the one on screen.
-  const r = src.span * 0.06;
-  for(let i = 0; i < PICKS3D.length; i++){
-    const q = PICKS3D[i];
-    if(Math.hypot(p[0]-q.x, p[1]-q.y, p[2]-q.z) <= q.r){
-      PICKS3D.splice(i, 1); afterPickChange(); return;
+/* Which tessellation triangles touch which, by shared edge.
+
+   Built from rounded coordinates rather than vertex numbers because the
+   viewer is handed geometry two ways -- an indexed mesh for a solved solid,
+   and bare coordinate triples for a plain tessellation -- and only one of
+   those has vertex numbers to share. Rounding to a ten-thousandth of a
+   millimetre is far finer than any tessellator's own tolerance and far
+   coarser than floating-point noise, so the two copies of a shared edge meet
+   on the same key. Cached on the source: it costs one pass over the
+   triangles, and only when a face is first selected. */
+function tri3dAdj(src){
+  if(src._adj) return src._adj;
+  const verts = src.verts || null, tris = src.tris;
+  const key = p => Math.round(p[0] * 1e4) + ',' + Math.round(p[1] * 1e4)
+                   + ',' + Math.round(p[2] * 1e4);
+  const edge = new Map(), adj = [];
+  for(let i = 0; i < tris.length; i++) adj.push([]);
+  for(let i = 0; i < tris.length; i++){
+    const t = tris[i];
+    const P = verts ? [verts[t[0]], verts[t[1]], verts[t[2]]] : t;
+    const k = [key(P[0]), key(P[1]), key(P[2])];
+    for(let e = 0; e < 3; e++){
+      const a = k[e], b = k[(e + 1) % 3];
+      const kk = a < b ? a + '|' + b : b + '|' + a;
+      const prev = edge.get(kk);
+      if(prev === undefined) edge.set(kk, i);
+      else {adj[i].push(prev); adj[prev].push(i)}
     }
   }
-  PICKS3D.push(Object.assign({role: pickMode, x: p[0], y: p[1], z: p[2], r: r},
+  src._adj = adj;
+  return adj;
+}
+
+function tri3dGeom(src, i){
+  const t = src.tris[i];
+  const P = src.verts ? [src.verts[t[0]], src.verts[t[1]], src.verts[t[2]]] : t;
+  const ux = P[1][0]-P[0][0], uy = P[1][1]-P[0][1], uz = P[1][2]-P[0][2];
+  const vx = P[2][0]-P[0][0], vy = P[2][1]-P[0][1], vz = P[2][2]-P[0][2];
+  const nx = uy*vz - uz*vy, ny = uz*vx - ux*vz, nz = ux*vy - uy*vx;
+  const L = Math.hypot(nx, ny, nz) || 1;
+  return {P: P, n: [nx/L, ny/L, nz/L], a: L / 2,
+          c: [(P[0][0]+P[1][0]+P[2][0])/3, (P[0][1]+P[1][1]+P[2][1])/3,
+              (P[0][2]+P[1][2]+P[2][2])/3]};
+}
+
+/* The whole face under the cursor, on a solid.
+
+   Grow out from the clicked triangle across shared edges while the normal
+   holds and the neighbour stays in the same plane. Three degrees of turn is
+   the cutoff, which is tighter than any tessellator's facets on a curve and
+   looser than the noise on a flat one.
+
+   What comes back is a plane -- a point, a normal and a radius -- and not a
+   list of triangles, because the solver holds a tetrahedral mesh of the same
+   solid and a triangle number from the viewer means nothing in it. A plane
+   means the same thing in both.
+
+   A curved surface is declined outright rather than described badly. That is
+   the honest answer and not a gap:
+   the one case a flood against the clicked normal cannot report honestly: on
+   the wall of a bore every neighbour is a degree or two off, so the flood
+   stops a few facets in and hands back a sliver of wall while calling it a
+   face. Returning nothing lets the caller place a point, whose sphere covers
+   the bore -- which is what clicking a bore already did and is the right
+   answer for one.
+
+   The test for curvature is read off the clicked triangle's own neighbours,
+   before any flooding. A flat face's neighbours are either exactly co-planar
+   or a long way off, round an edge; "slightly off" belongs to nothing but a
+   curve. */
+function faceAt3d(src, ti){
+  const adj = tri3dAdj(src);
+  const g0 = tri3dGeom(src, ti), n0 = g0.n, c0 = g0.c;
+  for(const j of adj[ti]){
+    const h = tri3dGeom(src, j);
+    const c = Math.abs(h.n[0]*n0[0] + h.n[1]*n0[1] + h.n[2]*n0[2]);
+    if(c > 0.9 && c < 0.99999) return null;        // 0.26 to 26 degrees off
+  }
+  const planeTol = Math.max(src.span * 0.002, 0.02);
+  const seen = new Set([ti]), queue = [ti], patch = [];
+  while(queue.length){
+    const i = queue.pop();
+    patch.push(tri3dGeom(src, i));
+    for(const j of adj[i]){
+      if(seen.has(j)) continue;
+      const h = tri3dGeom(src, j);
+      if(h.n[0]*n0[0] + h.n[1]*n0[1] + h.n[2]*n0[2] < 0.9986) continue;
+      const off = (h.c[0]-c0[0])*n0[0] + (h.c[1]-c0[1])*n0[1]
+                + (h.c[2]-c0[2])*n0[2];
+      if(Math.abs(off) > planeTol) continue;
+      seen.add(j); queue.push(j);
+    }
+  }
+  // One or two triangles is a sliver, not a face. Saying so lets the caller
+  // place a point, which is honest; a two-triangle "face" would claim an
+  // extent it does not have.
+  if(patch.length < 3) return null;
+  let A = 0, cx = 0, cy = 0, cz = 0, nx = 0, ny = 0, nz = 0;
+  for(const g of patch){
+    A += g.a;
+    cx += g.c[0]*g.a; cy += g.c[1]*g.a; cz += g.c[2]*g.a;
+    nx += g.n[0]*g.a; ny += g.n[1]*g.a; nz += g.n[2]*g.a;
+  }
+  if(!(A > 0)) return null;
+  cx /= A; cy /= A; cz /= A;
+  const nl = Math.hypot(nx, ny, nz) || 1;
+  nx /= nl; ny /= nl; nz /= nl;
+  let r = 0, flat = 0;
+  for(const g of patch)
+    for(const v of g.P){
+      r = Math.max(r, Math.hypot(v[0]-cx, v[1]-cy, v[2]-cz));
+      flat = Math.max(flat, Math.abs((v[0]-cx)*nx + (v[1]-cy)*ny
+                                     + (v[2]-cz)*nz));
+    }
+  if(r <= 0) return null;
+  const mm2 = A;
+  // Belt and braces. The flood only crosses into facets whose midpoints are
+  // on the plane, so a patch that is not flat at its vertices should not
+  // exist -- and if it does, describing it as a plane would hand the solver a
+  // sheet cutting through the part, so decline and let a point be placed.
+  if(flat > Math.max(src.span * 0.004, 0.05)) return null;
+  // The band the solver may call "on this plane". It absorbs the difference
+  // between the skin drawn here and the tetrahedral surface the solver holds,
+  // which is an element thick, not a part thick -- so it scales gently and is
+  // capped. A wide band on a stepped part would reach the next step up.
+  return {shape: 'plane', x: cx, y: cy, z: cz, r: r * 1.02,
+          nx: nx, ny: ny, nz: nz,
+          tol: Math.min(Math.max(src.span * 0.002, 0.15), 0.8),
+          label: 'face ' + mm2.toFixed(0) + ' mm²'};
+}
+
+/* What a click on the solid turns into. */
+function make3dPick(e){
+  const src = solid3d || mesh3d; if(!src) return null;
+  const hit = pick3dAt(e);
+  if(!hit) return null;
+  if(pickShape === 'face'){
+    const f = faceAt3d(src, hit.ti);
+    if(f) return f;
+  }
+  // One capture radius for every point pick, scaled to the part. A sphere on
+  // a tessellated surface is a blunt instrument, and sizing it per click would
+  // mean guessing at a feature the viewer cannot see -- the solver holds a
+  // different mesh from the one on screen.
+  return {x: hit.p[0], y: hit.p[1], z: hit.p[2], r: src.span * 0.06};
+}
+
+/* Which 3D marker is under the cursor, measured on screen rather than in
+   space: the part turns, and "within 10 mm of the marker" picks up points on
+   the far side of a small part that the cursor is nowhere near. */
+function pick3dHitTest(e){
+  const cv = $('cv3d'), b = cv.getBoundingClientRect();
+  if(!b.width || !b.height) return -1;
+  const mx = (e.clientX - b.left) * cv.width / b.width;
+  const my = (e.clientY - b.top) * cv.height / b.height;
+  let hit = -1, bd = 1e9;
+  for(const m of _pick3dScreen){
+    const d = Math.hypot(mx - m.sx, my - m.sy);
+    if(d <= 13 && d < bd){bd = d; hit = m.i}
+  }
+  return hit;
+}
+
+function solidClick(e){
+  if(_suppressClick){_suppressClick = false; return}
+  if(pickMode === 'off' || v3.dragged) return;
+  const src = solid3d || mesh3d; if(!src) return;
+  const hit = pick3dHitTest(e);
+  if(hit >= 0){
+    SEL = {list: '3d', i: hit};
+    setStatusHint('Selected. Drag to move it, Backspace to delete it.');
+    afterPickChange();
+    return;
+  }
+  const f = make3dPick(e);
+  if(!f){setStatusHint('Click on the solid itself.'); return}
+  PICKS3D.push(Object.assign({role: pickMode}, f,
                              pickMode === 'load' ? loadSpec() : {}));
+  SEL = {list: '3d', i: PICKS3D.length - 1};
+  afterPickChange();
+}
+
+/* Dragging a marker on the solid re-picks the surface under the cursor, the
+   same way the flat views re-snap: the marker stays on the part instead of
+   sliding off into space while the camera stays put. Orbiting is suppressed
+   for the duration, which is why the mousedown handler checks for a marker
+   before it decides the gesture is a rotation. */
+function solidMove(e){
+  if(!PDRAG || PDRAG.list !== '3d') return;
+  if(Math.abs(e.clientX - PDRAG.x0) > 3 || Math.abs(e.clientY - PDRAG.y0) > 3)
+    PDRAG.moved = true;
+  if(!PDRAG.moved) return;
+  const p = PICKS3D[PDRAG.i];
+  if(!p){PDRAG = null; return}
+  const f = make3dPick(e);
+  if(!f) return;
+  for(const k of ['shape', 'x', 'y', 'z', 'r', 'nx', 'ny', 'nz', 'tol',
+                  'label'])
+    delete p[k];
+  Object.assign(p, f);
+  afterPickChange();
+}
+
+function solidUp(){
+  if(!PDRAG || PDRAG.list !== '3d') return;
+  if(PDRAG.moved) _suppressClick = true;
+  PDRAG = null;
+  $('cv3d').style.cursor = (pickMode === 'off') ? 'grab' : 'crosshair';
+}
+
+/* Backspace deletes what is selected.
+   Guarded against firing while something is being typed: the panel is full of
+   number boxes, and a tool that ate Backspace in a text field would be
+   unusable. Delete does the same thing, because half of everyone reaches for
+   that one. */
+function pickKey(e){
+  if(e.key !== 'Backspace' && e.key !== 'Delete') return;
+  const t = e.target, tag = t && t.tagName;
+  if(tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
+     || (t && t.isContentEditable)) return;
+  if(!SEL) return;
+  const list = SEL.list === '3d' ? PICKS3D : PICKS;
+  if(SEL.i < 0 || SEL.i >= list.length){SEL = null; return}
+  e.preventDefault();
+  list.splice(SEL.i, 1);
+  SEL = null;
+  setStatusHint('Deleted.');
   afterPickChange();
 }
 
 /* ---- shared ------------------------------------------------------------ */
 
-function clearPicks(){PICKS = []; PICKS3D = []; afterPickChange()}
+function clearPicks(){PICKS = []; PICKS3D = []; SEL = null; afterPickChange()}
 
 function setStatusHint(msg){
   const el = $('pickHint'); if(!el) return;
@@ -2060,9 +2511,11 @@ function afterPickChange(){
 
 function renderPickList(){
   const hint = $('pickHint');
-  if(hint) hint.textContent =
-    'Works on the stress map, the pocketing view and the 3D solid. Anything '
-    + 'placed here is used instead of the load case above.';
+  if(hint) hint.textContent = (pickMode === 'off')
+    ? 'Works on the stress map, the pocketing view and the 3D solid. Anything '
+      + 'placed here is used instead of the load case above.'
+    : 'Click to place. Click a marker to select it, drag it to move it, '
+      + 'Backspace to delete it.';
   const el = $('pickList'); if(!el) return;
   const n = PICKS.length + PICKS3D.length;
   $('pickClear').style.display = n ? '' : 'none';
@@ -2073,6 +2526,7 @@ function renderPickList(){
   }
   const all = PICKS.concat(PICKS3D);
   const held = all.filter(p => p.role === 'fixed').length;
+  const heldF = all.filter(p => p.role === 'fixed' && p.shape).length;
   const loads = all.filter(p => p.role === 'load');
   // Group the loads by what they actually are. One line per kind beats one
   // total, because the whole point of the direction picker is that two
@@ -2088,10 +2542,14 @@ function renderPickList(){
       const nm = {down: '↓', up: '↑', left: '←', right: '→'}[p.dir] || '';
       k = m.toFixed(0) + ' N ' + nm;
     }
+    // Whether it sits on a face or a point changes how the part answers, not
+    // just how it looks, so the summary says which.
+    if(p.shape) k += ' on a face';
     kinds[k] = (kinds[k] || 0) + 1;
   }
   const bits = [];
-  if(held) bits.push(held + ' point' + (held > 1 ? 's' : '') + ' held');
+  if(held) bits.push(held + ' ' + (heldF === held ? 'face' : 'point')
+                     + (held > 1 ? 's' : '') + ' held');
   for(const k in kinds) bits.push(kinds[k] + ' × ' + k);
   const loaded = loads.length;
   el.innerHTML = '<div style="font-size:.64rem;color:#a3a3a3;line-height:1.6">'
@@ -2108,8 +2566,62 @@ function renderPickList(){
    instead of looking like one that worked. */
 function drawPicks(ctx, s, k){
   k = k || 1;
-  for(const p of PICKS)
-    pickGlyph(ctx, p.x * k, p.y * k, p.r * k, p.role, s, p);
+  for(let i = 0; i < PICKS.length; i++){
+    const p = PICKS[i];
+    const on = !!(SEL && SEL.list === '2d' && SEL.i === i);
+    if(p.shape === 'span') spanGlyph(ctx, p, s, k, on);
+    else pickGlyph(ctx, p.x * k, p.y * k, p.r * k, p.role, s, p, on);
+  }
+}
+
+/* A selected face, drawn as the stretch of outline it actually is.
+   Repeating the point glyph along it, rather than inventing a second symbol,
+   keeps a clamped face reading as the same condition as a clamped point --
+   spread out, which is the only difference there is. */
+function spanGlyph(ctx, p, s, k, on){
+  const ax = p.x0 * k, ay = p.y0 * k, bx = p.x1 * k, by = p.y1 * k;
+  const L = Math.hypot(bx - ax, by - ay) || 1;
+  ctx.save();
+  if(on){
+    ctx.strokeStyle = '#ffffff';
+    ctx.globalAlpha = 0.34;
+    ctx.lineWidth = Math.max(9, p.r * 2 * k + 7);
+    ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  ctx.strokeStyle = p.role === 'fixed' ? '#7dd3fc' : '#ffd166';
+  ctx.lineWidth = Math.max(3, 3.2 * s);
+  ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+  ctx.restore();
+  const step = Math.max(26 * s, 18);
+  const n = Math.max(2, Math.min(9, Math.floor(L / step) + 1));
+  const gr = Math.max(Math.min(L / (n * 2.1), 13 * s), 5);
+  if(p.role === 'fixed'){
+    // Hatching along the face, leaning off it, the way a fixed edge is drawn
+    // on any structural sketch. Not the point glyph's little ground symbol
+    // repeated: that one always points down the page, and on a vertical face
+    // it reads as a row of marks that have nothing to do with the edge.
+    const ux = (bx - ax) / L, uy = (by - ay) / L, nx = -uy, ny = ux;
+    ctx.save();
+    ctx.strokeStyle = '#7dd3fc';
+    ctx.lineWidth = Math.max(1.4, 1.8 * s);
+    const m = Math.max(3, Math.min(16, Math.round(L / Math.max(11 * s, 9))));
+    for(let j = 0; j <= m; j++){
+      const t = j / m, hx = ax + (bx - ax) * t, hy = ay + (by - ay) * t;
+      const d = Math.max(6, 7 * s);
+      ctx.beginPath();
+      ctx.moveTo(hx, hy);
+      ctx.lineTo(hx + (nx - ux) * d, hy + (ny - uy) * d);
+      ctx.stroke();
+    }
+    ctx.restore();
+    return;
+  }
+  for(let j = 0; j < n; j++){
+    const t = j / (n - 1);
+    pickGlyph(ctx, ax + (bx - ax) * t, ay + (by - ay) * t, gr, p.role, s, p,
+              false, true);
+  }
 }
 
 /* The arrow points where the force actually points.
@@ -2117,13 +2629,22 @@ function drawPicks(ctx, s, k){
    tell a sideways pull from a downward one, which is precisely what the
    direction picker exists to let them say. Pressure and torque get their own
    marks, since neither has a single direction to draw. */
-function pickGlyph(ctx, x, y, r, role, s, p){
+function pickGlyph(ctx, x, y, r, role, s, p, on, noRing){
   const held = role === 'fixed';
   ctx.save();
+  // Selection reads as a halo, not as a colour change: a selected support is
+  // still a support, and recolouring it would make it look like a load.
+  if(on){
+    ctx.strokeStyle = '#ffffff';
+    ctx.globalAlpha = 0.5;
+    ctx.lineWidth = Math.max(2, 2.5 * s);
+    ctx.beginPath(); ctx.arc(x, y, r + 4 * s, 0, 6.2832); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
   ctx.lineWidth = Math.max(1.5, 2 * s);
   ctx.strokeStyle = held ? '#7dd3fc' : '#ffd166';
   ctx.fillStyle = '#ffd166';
-  ctx.beginPath(); ctx.arc(x, y, r, 0, 6.2832); ctx.stroke();
+  if(!noRing){ctx.beginPath(); ctx.arc(x, y, r, 0, 6.2832); ctx.stroke()}
   if(held){
     for(let k = -2; k <= 2; k++){
       const a = x + k * r * 0.45, b = y + r;
@@ -2172,11 +2693,52 @@ function pickGlyph(ctx, x, y, r, role, s, p){
    on the surface as it turns. Drawn last and unsorted: a marker hidden behind
    the part it is attached to would be worse than one that shows through. */
 function drawPicks3d(ctx, rot, S){
-  for(const p of PICKS3D){
+  _pick3dScreen = [];
+  for(let i = 0; i < PICKS3D.length; i++){
+    const p = PICKS3D[i];
+    const on = !!(SEL && SEL.list === '3d' && SEL.i === i);
     const q = S(rot([p.x, p.y, p.z]));
+    _pick3dScreen.push({i: i, sx: q[0], sy: q[1]});
     ctx.save();
     ctx.lineWidth = 2;
     ctx.strokeStyle = p.role === 'fixed' ? '#7dd3fc' : '#ffd166';
+    // A selected face shows its own extent: the circle that the patch fits
+    // inside, drawn in the plane the solver was handed, so what is on screen
+    // is what was sent rather than a symbol standing in for it.
+    if(p.shape === 'plane' && p.r > 0){
+      const n = [p.nx, p.ny, p.nz];
+      const ref = Math.abs(n[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+      let t1 = [n[1]*ref[2] - n[2]*ref[1], n[2]*ref[0] - n[0]*ref[2],
+                n[0]*ref[1] - n[1]*ref[0]];
+      const l1 = Math.hypot(t1[0], t1[1], t1[2]) || 1;
+      t1 = [t1[0]/l1, t1[1]/l1, t1[2]/l1];
+      const t2 = [n[1]*t1[2] - n[2]*t1[1], n[2]*t1[0] - n[0]*t1[2],
+                  n[0]*t1[1] - n[1]*t1[0]];
+      ctx.beginPath();
+      for(let j = 0; j <= 28; j++){
+        const a = j * 6.2832 / 28, ca = Math.cos(a) * p.r, sa = Math.sin(a) * p.r;
+        const w = S(rot([p.x + t1[0]*ca + t2[0]*sa,
+                         p.y + t1[1]*ca + t2[1]*sa,
+                         p.z + t1[2]*ca + t2[2]*sa]));
+        if(j) ctx.lineTo(w[0], w[1]); else ctx.moveTo(w[0], w[1]);
+      }
+      ctx.closePath();
+      ctx.globalAlpha = on ? 0.3 : 0.17;
+      ctx.fillStyle = p.role === 'fixed' ? '#7dd3fc' : '#ffd166';
+      ctx.fill();
+      ctx.globalAlpha = on ? 0.95 : 0.6;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.lineWidth = 2;
+    }
+    if(on){
+      ctx.save();
+      ctx.strokeStyle = '#ffffff';
+      ctx.globalAlpha = 0.6;
+      ctx.beginPath(); ctx.arc(q[0], q[1], 13, 0, 6.2832); ctx.stroke();
+      ctx.restore();
+    }
     ctx.fillStyle = 'rgba(0,0,0,.45)';
     ctx.beginPath(); ctx.arc(q[0], q[1], 9, 0, 6.2832); ctx.fill(); ctx.stroke();
     ctx.beginPath();
@@ -2195,22 +2757,52 @@ function drawPicks3d(ctx, rot, S){
   }
 }
 
+/* Only the fields the solver reads, and the face geometry only when there is
+   a face. Sending shape:'span' with no endpoints would be a pick that claims
+   to be something it is not, and the server would be right to drop it. */
 function picksForPost(){
-  return PICKS.map(p => ({role: p.role, x: p.x, y: p.y, r: p.r, label: p.label,
-                          fx: p.fx || 0, fy: p.fy || 0,
-                          torque: p.torque || 0, pressure: p.pressure || 0}));
+  return PICKS.map(p => {
+    const q = {role: p.role, x: p.x, y: p.y, r: p.r, label: p.label,
+               fx: p.fx || 0, fy: p.fy || 0,
+               torque: p.torque || 0, pressure: p.pressure || 0};
+    if(p.shape === 'span')
+      Object.assign(q, {shape: 'span', x0: p.x0, y0: p.y0,
+                        x1: p.x1, y1: p.y1});
+    return q;
+  });
 }
 function picks3dForPost(){
-  return PICKS3D.map(p => ({role: p.role, x: p.x, y: p.y, z: p.z, r: p.r,
-                            fx: p.fx || 0, fy: p.fy || 0, fz: p.fz || 0,
-                            torque: p.torque || 0,
-                            pressure: p.pressure || 0}));
+  return PICKS3D.map(p => {
+    const q = {role: p.role, x: p.x, y: p.y, z: p.z, r: p.r,
+               fx: p.fx || 0, fy: p.fy || 0, fz: p.fz || 0,
+               torque: p.torque || 0, pressure: p.pressure || 0};
+    if(p.shape === 'plane')
+      Object.assign(q, {shape: 'plane', nx: p.nx, ny: p.ny, nz: p.nz,
+                        tol: p.tol || 0.6});
+    return q;
+  });
 }
 
 function initPicks(){
   $('cv').addEventListener('click', e => {if(view === 'stress') flatClick($('cv'), e)});
   $('cvp').addEventListener('click', e => {if(view === 'pocket') flatClick($('cvp'), e)});
   $('cv3d').addEventListener('click', solidClick);
+  // Drag. mousedown decides whether the gesture is a drag at all, and only a
+  // mousedown that lands ON a marker starts one -- so a click in empty space
+  // still places, and on the solid a click in empty space still orbits.
+  $('cv').addEventListener('mousedown', e => {if(view === 'stress') flatDown($('cv'), e)});
+  $('cvp').addEventListener('mousedown', e => {if(view === 'pocket') flatDown($('cvp'), e)});
+  // On window, not on the canvas: a drag that runs off the edge of the picture
+  // should keep going, and the release should be heard wherever it happens.
+  window.addEventListener('mousemove', e => {
+    if(!PDRAG) return;
+    if(PDRAG.list === '3d') solidMove(e); else flatMove(e);
+  });
+  window.addEventListener('mouseup', () => {
+    if(!PDRAG) return;
+    if(PDRAG.list === '3d') solidUp(); else flatUp();
+  });
+  window.addEventListener('keydown', pickKey);
   $('loadCase').addEventListener('change', loadUnitLabel);
   $('load').addEventListener('input', renderPickList);
   $('pickMag').addEventListener('input', renderPickList);

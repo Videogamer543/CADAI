@@ -168,6 +168,22 @@ def _parse_picks(raw, dims=2):
             continue
         rec = {"role": ("fixed" if role in ("fixed", "support") else role),
                "x": num("x"), "y": num("y"), "r": r}
+        # A face selection. The extra numbers are validated the same way as
+        # everything else and the shape word is only honoured when the geometry
+        # that goes with it is actually present, so a pick claiming to be a
+        # span but carrying no endpoints degrades to the point it already is
+        # rather than reaching the solver half-formed.
+        shape = str(it.get("shape") or "").lower()
+        if shape == "span" and dims == 2:
+            x0, y0 = num("x0", rec["x"]), num("y0", rec["y"])
+            x1, y1 = num("x1", rec["x"]), num("y1", rec["y"])
+            if math.hypot(x1 - x0, y1 - y0) > 0.0:
+                rec.update(shape="span", x0=x0, y0=y0, x1=x1, y1=y1)
+        elif shape == "plane" and dims == 3:
+            nx, ny, nz = num("nx"), num("ny"), num("nz")
+            if math.sqrt(nx * nx + ny * ny + nz * nz) > 0.0:
+                rec.update(shape="plane", nx=nx, ny=ny, nz=nz,
+                           tol=max(num("tol", 0.5), 0.05))
         if rec["role"] == "pin":
             dofs = str(it.get("dofs") or "xy").lower()
             rec["dofs"] = "".join(c for c in dofs if c in "xy") or "xy"

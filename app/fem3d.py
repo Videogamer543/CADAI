@@ -237,18 +237,95 @@ def _pick_facets3d(m, pick, boundary=None):
     draws and the tetrahedral surface the solver holds are two different
     meshes of the same solid. A facet number from one is meaningless in the
     other; a point in space means the same thing in both.
+
+    The same reasoning carries a selected FACE across, as shape="plane": the
+    viewer grows a patch of its own triangles out from the click while the
+    normal holds, and sends the plane that patch lies in -- a point, a normal,
+    and a radius covering it. Here that becomes three tests on the solver's own
+    boundary: near the plane, aimed the same way, and inside the radius. The
+    alignment test is the one that does the real work, because a plane through
+    a part also passes through whatever is on the far side of it, and without
+    checking which way a facet faces, selecting the top of a 6 mm plate also
+    selects the bottom of it.
     """
     if boundary is None:
         boundary = m.boundary_facets()
     boundary = np.asarray(boundary, np.int64)
     if boundary.size == 0:
         return boundary
-    mids = np.asarray(m.p)[:, np.asarray(m.facets)[:, boundary]].mean(axis=1)
+    fv = np.asarray(m.facets)[:, boundary]               # (3, k) vertex ids
+    pts = np.asarray(m.p)[:, fv]                         # (3, 3, k)
+    mids = pts.mean(axis=1)
     c = np.array([float(pick.get("x", 0.0)), float(pick.get("y", 0.0)),
                   float(pick.get("z", 0.0))]) * 1e-3
     r = max(float(pick.get("r", 0.0)), 1e-6) * 1e-3
     d = np.sqrt(((mids - c[:, None]) ** 2).sum(axis=0))
-    return boundary[d <= r]
+    if str(pick.get("shape") or "") != "plane":
+        return boundary[d <= r]
+
+    n = np.array([float(pick.get("nx", 0.0)), float(pick.get("ny", 0.0)),
+                  float(pick.get("nz", 0.0))])
+    ln = float(np.linalg.norm(n))
+    if ln <= 0.0:
+        return boundary[d <= r]
+    n = n / ln
+    # Band half-thickness. Generous enough that a tetrahedral surface's own
+    # facet midpoints -- which sit a fraction of an element inside the
+    # tessellated skin the viewer drew -- still read as on the plane.
+    tol = max(float(pick.get("tol", 0.0)), 0.05) * 1e-3
+
+    # OUTWARD facet normals, resolved rather than assumed.
+    #
+    # The sign matters and neither source can supply it. skfem orders a
+    # facet's vertices however the mesher left them, so the cross product
+    # points into the part as often as out of it, and the viewer's own winding
+    # is no more trustworthy. Without a sign the alignment test has to be
+    # taken in absolute value, and then the far face of a plate -- whose normal
+    # is exactly anti-parallel -- passes it, so selecting the top of a 1 mm
+    # sheet also selects the bottom.
+    #
+    # Each boundary facet belongs to exactly one tetrahedron, so the direction
+    # from that tetrahedron's centroid towards the facet is outward by
+    # construction. That settles the solver's side of it; the pick's normal is
+    # then signed to agree with the facet nearest the click, which is the one
+    # piece of geometry both the viewer and the solver certainly agree about.
+    fn = np.cross(pts[:, 1, :] - pts[:, 0, :], pts[:, 2, :] - pts[:, 0, :],
+                  axis=0)
+    fl = np.sqrt((fn ** 2).sum(axis=0))
+    fl[fl <= 0.0] = 1.0
+    fn = fn / fl
+    signed = False
+    try:
+        host = np.asarray(m.f2t)[0, boundary]
+        tc = np.asarray(m.p)[:, np.asarray(m.t)[:, host]].mean(axis=1)
+        out = np.sign(((mids - tc) * fn).sum(axis=0))
+        out[out == 0] = 1.0
+        fn = fn * out
+        near = int(np.argmin(d))
+        if float((fn[:, near] * n).sum()) < 0.0:
+            n = -n
+        signed = True
+    except Exception:
+        # No element map to orient against: fall back to the unsigned test,
+        # which is right about everything except the far side of a thin wall.
+        signed = False
+    align = (fn * n[:, None]).sum(axis=0)
+    if not signed:
+        align = np.abs(align)
+    flat = np.abs(((mids - c[:, None]) * n[:, None]).sum(axis=0))
+    keep = (d <= r) & (flat <= tol) & (align >= 0.86)
+    if keep.any():
+        return boundary[keep]
+    # Never hand back an empty face: a plane that matched nothing would
+    # silently drop the condition, and a dropped support is a free-floating
+    # part. Relax once, then fall back to the single nearest facet -- the same
+    # thing a point pick would have selected. Not the whole sphere of radius r:
+    # r spans the FACE, and a sphere that wide reaches round the edges of the
+    # part and clamps three sides instead of one.
+    keep = (d <= r) & (flat <= 3.0 * tol) & (align >= 0.5)
+    if keep.any():
+        return boundary[keep]
+    return boundary[[int(np.argmin(d))]]
 
 
 def solve_solid(nodes_mm, tets, *, E=69e9, nu=0.33, load_case="cantilever",

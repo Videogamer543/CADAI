@@ -110,6 +110,15 @@ def _pick_facets(m, m_per_px, pick, boundary=None):
 
     Nothing here knows what a "hole" is, which is the point. A UI that
     identifies features differently later does not need this to change.
+
+    A pick carrying shape="span" is a selected FACE rather than a point: the
+    two ends of a straight stretch of outline, with r as the band half-width
+    either side of it. The distance measured is then to the segment instead of
+    to a centre, which matters because a disc big enough to cover a 50 mm edge
+    is also big enough to reach round the corner and grab the two faces next
+    to it -- the exact failure that makes "select the whole left face" collapse
+    into "clamp the left third of the part". A segment has no such reach: a
+    facet 2 mm off the line is in, a facet 2 mm past the end is out.
     """
     if boundary is None:
         boundary = m.boundary_facets()
@@ -117,9 +126,23 @@ def _pick_facets(m, m_per_px, pick, boundary=None):
     if boundary.size == 0:
         return boundary
     mids = _facet_mids(m, boundary)
+    r = max(float(pick.get("r", 0.0)), 1.0) * m_per_px
+    if str(pick.get("shape") or "") == "span":
+        ax = float(pick.get("x0", pick.get("x", 0.0))) * m_per_px
+        ay = float(pick.get("y0", pick.get("y", 0.0))) * m_per_px
+        bx = float(pick.get("x1", pick.get("x", 0.0))) * m_per_px
+        by = float(pick.get("y1", pick.get("y", 0.0))) * m_per_px
+        ex, ey = bx - ax, by - ay
+        ll = ex * ex + ey * ey
+        if ll <= 0.0:
+            d = np.hypot(mids[0] - ax, mids[1] - ay)
+        else:
+            t = ((mids[0] - ax) * ex + (mids[1] - ay) * ey) / ll
+            t = np.clip(t, 0.0, 1.0)
+            d = np.hypot(mids[0] - (ax + t * ex), mids[1] - (ay + t * ey))
+        return boundary[d <= r]
     cx = float(pick.get("x", 0.0)) * m_per_px
     cy = float(pick.get("y", 0.0)) * m_per_px
-    r = max(float(pick.get("r", 0.0)), 1.0) * m_per_px
     d = np.hypot(mids[0] - cx, mids[1] - cy)
     return boundary[d <= r]
 
