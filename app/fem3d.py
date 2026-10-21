@@ -224,6 +224,114 @@ def _linsolve(K, f, D):
     return solve(*sysm), "SuperLU (scipy)"
 
 
+def _outward_facet_normals(m, boundary, pts, mids):
+    """Unit OUTWARD normal per boundary facet, and whether the sign is real.
+
+    The sign matters and the mesh does not supply it. skfem orders a facet's
+    vertices however the mesher left them, so the cross product points into
+    the part as often as out of it. Without a sign an alignment test has to be
+    taken in absolute value, and then the far face of a plate -- whose normal
+    is exactly anti-parallel -- passes it, so selecting the top of a thin
+    sheet also selects the bottom.
+
+    Each boundary facet belongs to exactly one tetrahedron, so the direction
+    from that tetrahedron's centroid towards the facet is outward by
+    construction. Returns (normals, True) when that worked and (normals,
+    False) when there was no element map to orient against, so the caller can
+    fall back to the unsigned test rather than trusting a sign it does not
+    have.
+    """
+    fn = np.cross(pts[:, 1, :] - pts[:, 0, :], pts[:, 2, :] - pts[:, 0, :],
+                  axis=0)
+    fl = np.sqrt((fn ** 2).sum(axis=0))
+    fl[fl <= 0.0] = 1.0
+    fn = fn / fl
+    try:
+        host = np.asarray(m.f2t)[0, boundary]
+        tc = np.asarray(m.p)[:, np.asarray(m.t)[:, host]].mean(axis=1)
+        out = np.sign(((mids - tc) * fn).sum(axis=0))
+        out[out == 0] = 1.0
+        return fn * out, True
+    except Exception:
+        return fn, False
+
+
+def _patch_facets(m, boundary, pts, mids, d, pick):
+    """A selected face of ANY shape, carried as sampled points with normals.
+
+    A plane cannot describe the wall of a bore or the inside of a domed
+    pocket, and those are faces a person expects to be able to select -- in
+    any CAD package, clicking a cylindrical face selects the whole cylinder.
+    The first version of this refused them and quietly placed a point instead,
+    which is the behaviour that prompted the rewrite.
+
+    So the viewer sends the face as a cloud: a few hundred points spread over
+    it, each with the surface normal there, plus one radius. A boundary facet
+    joins the selection when its midpoint is near SOME sample and it faces the
+    same way as that sample. Nothing in that depends on the face being flat,
+    or on the two meshes agreeing about anything beyond position in space --
+    which is the same principle the single-point pick already rests on, with
+    one point turned into many.
+
+    The normal test is doing real work, not tidying up. The samples are spaced
+    across the face, so the radius has to be wide enough to cover the gaps
+    between them -- wide enough, on a thin wall, to reach the far side. The
+    far side's outward normal is reversed, so it fails the test and is left
+    alone.
+    """
+    smp = pick.get("pts") or []
+    if not smp:
+        return boundary[d <= max(float(pick.get("r", 0.0)), 1e-6) * 1e-3]
+    s = np.asarray(smp, float)
+    sp = s[:, 0:3].T * 1e-3                     # (3, n) sample positions
+    sn = s[:, 3:6].T                            # (3, n) sample normals
+    nl = np.sqrt((sn ** 2).sum(axis=0))
+    nl[nl <= 0.0] = 1.0
+    sn = sn / nl
+    r = max(float(pick.get("r", 0.0)), 1e-6) * 1e-3
+
+    fn, signed = _outward_facet_normals(m, boundary, pts, mids)
+
+    # Nearest sample to each facet, and how far. A KD-tree because the facet
+    # count runs to tens of thousands and the sample count to a few hundred,
+    # and the all-pairs matrix is the kind of thing that works on the test
+    # part and runs the server out of memory on a real one.
+    try:
+        from scipy.spatial import cKDTree
+        near_i = cKDTree(sp.T).query(mids.T)[1]
+        dist = np.sqrt(((mids - sp[:, near_i]) ** 2).sum(axis=0))
+    except Exception:
+        dd = np.sqrt(((mids[:, :, None] - sp[:, None, :]) ** 2).sum(axis=0))
+        near_i = np.argmin(dd, axis=1)
+        dist = dd[np.arange(dd.shape[0]), near_i]
+
+    ref = sn[:, near_i]
+    # One global sign decision, not one per facet.
+    #
+    # Which means absolute orientation is deliberately NOT used: a tessellator
+    # may wind a face either way and the viewer cannot tell which, so a test
+    # that trusted the sign would reject half of all correct selections. What
+    # survives the flip is the RELATIVE orientation inside the patch, and that
+    # is what the test needs -- the far side of a thin wall faces the opposite
+    # way to the samples near it however the whole set is signed, so it is
+    # still refused.
+    align = (fn * ref).sum(axis=0)
+    if signed:
+        closest = int(np.argmin(dist))
+        if float(align[closest]) < 0.0:
+            align = -align
+    else:
+        align = np.abs(align)
+
+    keep = (dist <= r) & (align >= 0.5)
+    if keep.any():
+        return boundary[keep]
+    keep = (dist <= 2.0 * r) & (align >= 0.0)
+    if keep.any():
+        return boundary[keep]
+    return boundary[[int(np.argmin(dist))]]
+
+
 def _pick_facets3d(m, pick, boundary=None):
     """Boundary facets of a tet mesh inside a clicked sphere.
 
@@ -260,7 +368,10 @@ def _pick_facets3d(m, pick, boundary=None):
                   float(pick.get("z", 0.0))]) * 1e-3
     r = max(float(pick.get("r", 0.0)), 1e-6) * 1e-3
     d = np.sqrt(((mids - c[:, None]) ** 2).sum(axis=0))
-    if str(pick.get("shape") or "") != "plane":
+    shape = str(pick.get("shape") or "")
+    if shape == "patch":
+        return _patch_facets(m, boundary, pts, mids, d, pick)
+    if shape != "plane":
         return boundary[d <= r]
 
     n = np.array([float(pick.get("nx", 0.0)), float(pick.get("ny", 0.0)),
@@ -289,26 +400,11 @@ def _pick_facets3d(m, pick, boundary=None):
     # construction. That settles the solver's side of it; the pick's normal is
     # then signed to agree with the facet nearest the click, which is the one
     # piece of geometry both the viewer and the solver certainly agree about.
-    fn = np.cross(pts[:, 1, :] - pts[:, 0, :], pts[:, 2, :] - pts[:, 0, :],
-                  axis=0)
-    fl = np.sqrt((fn ** 2).sum(axis=0))
-    fl[fl <= 0.0] = 1.0
-    fn = fn / fl
-    signed = False
-    try:
-        host = np.asarray(m.f2t)[0, boundary]
-        tc = np.asarray(m.p)[:, np.asarray(m.t)[:, host]].mean(axis=1)
-        out = np.sign(((mids - tc) * fn).sum(axis=0))
-        out[out == 0] = 1.0
-        fn = fn * out
+    fn, signed = _outward_facet_normals(m, boundary, pts, mids)
+    if signed:
         near = int(np.argmin(d))
         if float((fn[:, near] * n).sum()) < 0.0:
             n = -n
-        signed = True
-    except Exception:
-        # No element map to orient against: fall back to the unsigned test,
-        # which is right about everything except the far side of a thin wall.
-        signed = False
     align = (fn * n[:, None]).sum(axis=0)
     if not signed:
         align = np.abs(align)
@@ -445,7 +541,8 @@ def solve_solid(nodes_mm, tets, *, E=69e9, nu=0.33, load_case="cantilever",
         # the 2D solver, for the same reason: pointing at the spot is the whole
         # instruction, and demanding a vector as well turns it into a form.
         bare = [q for q in load_picks
-                if not (q.get("fx") or q.get("fy") or q.get("fz"))]
+                if not (q.get("fx") or q.get("fy") or q.get("fz")
+                        or q.get("pressure"))]
         share = (float(load) / len(bare)) if bare else 0.0
         parts, used = [], []
         for q in load_picks:
@@ -455,6 +552,32 @@ def solve_solid(nodes_mm, tets, *, E=69e9, nu=0.33, load_case="cantilever",
             A = facet_area(sel)
             if A <= 0:
                 continue
+            # Pressure: a traction along the surface normal, the one load an
+            # arrow cannot express, and the natural thing to put on a bore now
+            # that a bore can be selected in one click. The 2D solver has had
+            # this since the Lame check; without it here, selecting a bore and
+            # typing a pressure fell through to the "no direction given" branch
+            # with a zero total and returned a part under no stress at all --
+            # a silent zero, which is the worst answer a stress tool can give.
+            #
+            # The traction on a surface under pressure p is -p*n with n the
+            # material's OUTWARD normal, so on the wall of a bore -- where the
+            # outward normal points into the hole -- it pushes the material
+            # away from the axis, which is what internal pressure does.
+            pr = float(q.get("pressure") or 0.0)
+            if pr:
+                @LinearForm
+                def pressload(v, w, pr=pr):
+                    dd = np.zeros_like(v[0])
+                    for i in range(3):
+                        dd = dd + w.n[i] * v[i]
+                    return -pr * dd
+
+                parts.append(asm(pressload, FacetBasis(m, e, facets=sel,
+                                                       intorder=2)))
+                used.append(sel)
+                if not (q.get("fx") or q.get("fy") or q.get("fz")):
+                    continue
             if q.get("fx") or q.get("fy") or q.get("fz"):
                 vec = np.array([float(q.get("fx") or 0.0),
                                 float(q.get("fy") or 0.0),

@@ -126,6 +126,10 @@ async def guard(request, call_next):
 
 
 MAX_PICKS = 64
+# Samples per selected curved face. Enough to cover a bore wall without the
+# radius having to be wide, few enough that sixty-four picks cannot turn one
+# request into megabytes of coordinates.
+MAX_PATCH_PTS = 400
 
 
 def _parse_picks(raw, dims=2):
@@ -184,6 +188,29 @@ def _parse_picks(raw, dims=2):
             if math.sqrt(nx * nx + ny * ny + nz * nz) > 0.0:
                 rec.update(shape="plane", nx=nx, ny=ny, nz=nz,
                            tol=max(num("tol", 0.5), 0.05))
+        elif shape == "patch" and dims == 3:
+            # A curved face: points with normals, spread over the surface.
+            # Every sample is checked rather than the list being trusted by
+            # its length -- one NaN in a coordinate would otherwise put a
+            # support somewhere the part is not, and a bad sample is cheaper
+            # to drop than a bad clamp is to notice.
+            raw_pts = it.get("pts")
+            good = []
+            if isinstance(raw_pts, list):
+                for q in raw_pts[:MAX_PATCH_PTS]:
+                    if not isinstance(q, (list, tuple)) or len(q) < 6:
+                        continue
+                    try:
+                        v = [float(a) for a in q[:6]]
+                    except (TypeError, ValueError):
+                        continue
+                    if not all(math.isfinite(a) for a in v):
+                        continue
+                    if math.sqrt(v[3] ** 2 + v[4] ** 2 + v[5] ** 2) <= 0.0:
+                        continue
+                    good.append(v)
+            if good:
+                rec.update(shape="patch", pts=good)
         if rec["role"] == "pin":
             dofs = str(it.get("dofs") or "xy").lower()
             rec["dofs"] = "".join(c for c in dofs if c in "xy") or "xy"

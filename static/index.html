@@ -350,7 +350,7 @@
         <button class="pkShape on" data-s="point" onclick="setPickShape('point')"
                 title="A spot on the outline, or a whole bore">Point</button>
         <button class="pkShape"    data-s="face"  onclick="setPickShape('face')"
-                title="The whole flat face under the cursor, corner to corner">Face</button>
+                title="The whole face under the cursor — flat or curved — out to its edges">Face</button>
       </div>
     </div>
     <!-- Load type and direction, SolidWorks-style: pick the kind of load here
@@ -2334,31 +2334,35 @@ function tri3dGeom(src, i){
    curve. */
 function faceAt3d(src, ti){
   const adj = tri3dAdj(src);
-  const g0 = tri3dGeom(src, ti), n0 = g0.n, c0 = g0.c;
-  for(const j of adj[ti]){
-    const h = tri3dGeom(src, j);
-    const c = Math.abs(h.n[0]*n0[0] + h.n[1]*n0[1] + h.n[2]*n0[2]);
-    if(c > 0.9 && c < 0.99999) return null;        // 0.26 to 26 degrees off
-  }
-  const planeTol = Math.max(src.span * 0.002, 0.02);
   const seen = new Set([ti]), queue = [ti], patch = [];
+  // Spread across shared edges while the surface keeps turning GENTLY,
+  // comparing each triangle to the one it was reached from rather than to the
+  // one that was clicked. That difference is the whole fix: measured against
+  // the clicked triangle, a flood can never leave the plane through it, so on
+  // a bore or a domed pocket it stopped a few facets in and the face came
+  // back as a point. Measured step by step it follows the curve all the way
+  // round and stops where the surface actually creases.
+  //
+  // Forty degrees is the crease angle. A tessellated curve turns by a few
+  // degrees per facet even when it is coarse, and a real edge between two
+  // faces is rarely shallower than forty -- the plate and the pocket wall in
+  // the screenshot that prompted this meet at ninety.
+  const COS_STEP = Math.cos(40 * Math.PI / 180);
   while(queue.length){
     const i = queue.pop();
-    patch.push(tri3dGeom(src, i));
+    const g = tri3dGeom(src, i);
+    patch.push(g);
     for(const j of adj[i]){
       if(seen.has(j)) continue;
       const h = tri3dGeom(src, j);
-      if(h.n[0]*n0[0] + h.n[1]*n0[1] + h.n[2]*n0[2] < 0.9986) continue;
-      const off = (h.c[0]-c0[0])*n0[0] + (h.c[1]-c0[1])*n0[1]
-                + (h.c[2]-c0[2])*n0[2];
-      if(Math.abs(off) > planeTol) continue;
+      if(h.n[0]*g.n[0] + h.n[1]*g.n[1] + h.n[2]*g.n[2] < COS_STEP) continue;
       seen.add(j); queue.push(j);
     }
   }
-  // One or two triangles is a sliver, not a face. Saying so lets the caller
-  // place a point, which is honest; a two-triangle "face" would claim an
-  // extent it does not have.
-  if(patch.length < 3) return null;
+  // One triangle is a sliver, not a face. Saying so lets the caller place a
+  // point, which is honest; a one-triangle "face" would claim an extent it
+  // does not have.
+  if(patch.length < 2) return null;
   let A = 0, cx = 0, cy = 0, cz = 0, nx = 0, ny = 0, nz = 0;
   for(const g of patch){
     A += g.a;
@@ -2378,19 +2382,46 @@ function faceAt3d(src, ti){
     }
   if(r <= 0) return null;
   const mm2 = A;
-  // Belt and braces. The flood only crosses into facets whose midpoints are
-  // on the plane, so a patch that is not flat at its vertices should not
-  // exist -- and if it does, describing it as a plane would hand the solver a
-  // sheet cutting through the part, so decline and let a point be placed.
-  if(flat > Math.max(src.span * 0.004, 0.05)) return null;
-  // The band the solver may call "on this plane". It absorbs the difference
-  // between the skin drawn here and the tetrahedral surface the solver holds,
-  // which is an element thick, not a part thick -- so it scales gently and is
-  // capped. A wide band on a stepped part would reach the next step up.
-  return {shape: 'plane', x: cx, y: cy, z: cz, r: r * 1.02,
-          nx: nx, ny: ny, nz: nz,
-          tol: Math.min(Math.max(src.span * 0.002, 0.15), 0.8),
-          label: 'face ' + mm2.toFixed(0) + ' mm²'};
+
+  if(flat <= Math.max(src.span * 0.004, 0.05)){
+    // Flat. A plane says it exactly and in six numbers, and the plane test on
+    // the solver's side is sharper than a cloud of samples can be, so flat
+    // faces keep using it.
+    //
+    // The band the solver may call "on this plane" absorbs the difference
+    // between the skin drawn here and the tetrahedral surface underneath,
+    // which is an element thick, not a part thick -- so it scales gently and
+    // is capped. A wide band on a stepped part would reach the next step up.
+    return {shape: 'plane', x: cx, y: cy, z: cz, r: r * 1.02,
+            nx: nx, ny: ny, nz: nz,
+            tol: Math.min(Math.max(src.span * 0.002, 0.15), 0.8),
+            label: 'face ' + mm2.toFixed(0) + ' mm²'};
+  }
+
+  // Curved: a bore, a fillet, the inside of a pocket. There is no plane to
+  // send, so the face goes as itself -- points spread over it, each carrying
+  // the surface normal there. Declining these was the old behaviour and it
+  // was wrong: in any CAD package clicking a cylindrical face selects the
+  // whole cylinder, and a stress tool that cannot say "this bore carries the
+  // load" cannot describe a bolted joint.
+  const MAX = 240;
+  const step = Math.max(1, Math.ceil(patch.length / MAX));
+  const samples = [];
+  for(let i = 0; i < patch.length; i += step){
+    const g = patch[i];
+    samples.push([g.c[0], g.c[1], g.c[2], g.n[0], g.n[1], g.n[2]]);
+  }
+  // One radius, sized so the discs round the samples overlap rather than
+  // leaving gaps of unselected face between them. Area per sample is A/n, so
+  // a disc of sqrt(A/(pi*n)) just covers its share and the 1.8 is the overlap.
+  // It is capped because on a thin wall a very wide radius would reach the
+  // far side -- the normal test refuses it there, but leaning on one guard
+  // when two are available is how the thin-plate bug happened the first time.
+  const rs = Math.min(1.8 * Math.sqrt(A / (Math.PI * samples.length)),
+                      Math.max(src.span * 0.05, 1.0));
+  return {shape: 'patch', x: cx, y: cy, z: cz, r: rs,
+          nx: nx, ny: ny, nz: nz, pts: samples,
+          label: 'curved face ' + mm2.toFixed(0) + ' mm²'};
 }
 
 /* What a click on the solid turns into. */
@@ -2459,7 +2490,7 @@ function solidMove(e){
   const f = make3dPick(e);
   if(!f) return;
   for(const k of ['shape', 'x', 'y', 'z', 'r', 'nx', 'ny', 'nz', 'tol',
-                  'label'])
+                  'pts', 'label'])
     delete p[k];
   Object.assign(p, f);
   afterPickChange();
@@ -2705,6 +2736,22 @@ function drawPicks3d(ctx, rot, S){
     // A selected face shows its own extent: the circle that the patch fits
     // inside, drawn in the plane the solver was handed, so what is on screen
     // is what was sent rather than a symbol standing in for it.
+    // A curved face shows the samples that were actually sent. Drawing the
+    // real thing rather than a symbol for it means a selection that grabbed
+    // half a bore looks like half a bore on screen, instead of looking
+    // correct and solving wrong.
+    if(p.shape === 'patch' && p.pts && p.pts.length){
+      ctx.save();
+      ctx.globalAlpha = on ? 0.95 : 0.65;
+      ctx.fillStyle = p.role === 'fixed' ? '#7dd3fc' : '#ffd166';
+      for(const s of p.pts){
+        const w = S(rot([s[0], s[1], s[2]]));
+        ctx.beginPath();
+        ctx.arc(w[0], w[1], on ? 2.6 : 2.0, 0, 6.2832);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
     if(p.shape === 'plane' && p.r > 0){
       const n = [p.nx, p.ny, p.nz];
       const ref = Math.abs(n[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
@@ -2779,6 +2826,12 @@ function picks3dForPost(){
     if(p.shape === 'plane')
       Object.assign(q, {shape: 'plane', nx: p.nx, ny: p.ny, nz: p.nz,
                         tol: p.tol || 0.6});
+    else if(p.shape === 'patch' && p.pts && p.pts.length)
+      // Rounded on the way out. Full double precision on several hundred
+      // samples is a few hundred kilobytes of request body saying nothing: a
+      // micron is already far finer than the tessellation these came off.
+      Object.assign(q, {shape: 'patch',
+                        pts: p.pts.map(a => a.map(v => +v.toFixed(4)))});
     return q;
   });
 }
