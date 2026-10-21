@@ -800,6 +800,20 @@ let mesh3d=null;
 function setFile(f){
   fileData=f;$('fname').textContent='📎 '+f.name;$('run').disabled=false;
   mesh3d=null; solid3d=null; $('tab3d').style.display='none';
+  // Placed supports and loads belong to the part they were placed on.
+  //
+  // They are stored in that part's own coordinates -- pixels for the flat
+  // views, millimetres for the solid -- so carrying them to a new file does
+  // not move them somewhere harmless, it points them at whatever happens to
+  // sit at those coordinates in the new part. The result is a solve held and
+  // loaded in places nobody chose, which looks like a working answer. Leaving
+  // them was a real bug, not untidiness.
+  if(PICKS.length || PICKS3D.length){
+    const n = PICKS.length + PICKS3D.length;
+    clearPicks();
+    setStatusHint(n + ' placed point' + (n > 1 ? 's were' : ' was')
+                  + ' cleared — they belonged to the previous part.');
+  }
   const isStep=/\.(step|stp)$/i.test(f.name);
   // Stale caption from the previous part is worse than none: it would claim
   // the new file was measured when it hasn't been looked at yet.

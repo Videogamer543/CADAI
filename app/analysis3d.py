@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 import numpy as np
 
@@ -112,26 +113,73 @@ def _mesh_step(data: bytes, target_tets: int = TARGET_TETS):
         from .vol_worker import STRATEGIES
         errs, note = [], ""
         nodes = tets = None
+        skip = set()
+        spent = []
+        t_ladder = time.time()
         for i in range(len(STRATEGIES)):
+            if i in skip:
+                continue
+            t0 = time.time()
             r = subprocess.run(
                 [sys.executable, "-m", "app.vol_worker", sp, out,
                  str(int(target_tets)), str(i)],
                 cwd=root, env=env, capture_output=True, timeout=300)
+            spent.append((STRATEGIES[i][0], time.time() - t0))
             if r.returncode == 0 and os.path.exists(out):
                 with np.load(out) as d:
                     nodes = np.array(d["nodes"], dtype=np.float64)
                     tets = np.array(d["tets"]).astype(np.int64)
                     label = str(d["note"]) if "note" in d.files else ""
                 if i:
+                    # Say where the wait went. A part that takes four minutes
+                    # to mesh looks, from the outside, exactly like one that
+                    # has hung; the difference is that several settings were
+                    # tried and the early ones failed slowly. Printing the
+                    # attempts and their seconds turns an opaque wait into
+                    # something the reader can act on.
+                    tried = ", ".join("%s %.0f s" % (n, t) for n, t in spent)
                     note = ("meshed with the '%s' fallback: the standard "
-                            "settings could not mesh this solid (%s). The "
-                            "stress field is real; treat fine detail near "
-                            "small features with a little caution."
-                            % (label or STRATEGIES[i][0], errs[0]))
+                            "settings could not mesh this solid (%s). "
+                            "%d settings were tried, %.0f s in all (%s) -- "
+                            "that is where the wait went. The stress field is "
+                            "real; treat fine detail near small features with "
+                            "a little caution."
+                            % (label or STRATEGIES[i][0], errs[0],
+                               len(spent), time.time() - t_ladder, tried))
                 break
             err = (r.stderr or b"").decode("utf8", "replace").strip()
             last = err.splitlines()[-1] if err else "no message"
             errs.append("%s: %s" % (STRATEGIES[i][0], last[:110]))
+
+            # Do not spend a minute on a setting that cannot fix THIS failure.
+            #
+            # "Invalid boundary mesh (overlapping facets)" is decided by one
+            # gmsh option, Mesh.AngleToleranceFacetOverlap, which is the last
+            # number in every row of the ladder. A later rung that leaves it
+            # unchanged fails in exactly the same way, and on a solid with a
+            # few hundred surfaces finding that out costs the best part of a
+            # minute. The standard rung and the HXT rung carry the same
+            # tolerance, so on this error the second one was pure waiting.
+            if "overlap" in last.lower():
+                def knobs(s):
+                    """The settings that can change a SURFACE mesh.
+
+                    Curvature segments, the minimum-size factor, the facet
+                    overlap tolerance, and whether OCC healing runs. Not
+                    Algorithm3D: that chooses how tetrahedra are recovered
+                    from a surface mesh gmsh has already validated, so it
+                    cannot change whether the validation passed.
+                    """
+                    return (s[1], s[3], s[4], bool(s[5]) if len(s) > 5
+                            else False)
+
+                for j in range(i + 1, len(STRATEGIES)):
+                    if j not in skip and knobs(STRATEGIES[j]) == \
+                            knobs(STRATEGIES[i]):
+                        skip.add(j)
+                        errs.append("%s: skipped, it changes only the 3D "
+                                    "algorithm, which runs after the check "
+                                    "that just failed" % STRATEGIES[j][0])
             try:
                 os.unlink(out)
             except Exception:
