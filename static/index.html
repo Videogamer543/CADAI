@@ -1989,6 +1989,49 @@ function loadSpec(){
   return out;
 }
 
+/* Directions a load on a SOLID can point.
+
+   Separate from DIRS because that list is drawn in the flat views' own frame
+   -- "down" there means down the picture. A solid can be turned any way up,
+   so its directions are the model's own axes, plus "into the face", which is
+   what a pressure or a bearing load with no direction chosen yet physically
+   is. */
+const DIR3 = [
+  {k: '-z', v: [0, 0, -1], lbl: 'along −Z'},
+  {k: '+z', v: [0, 0, 1],  lbl: 'along +Z'},
+  {k: '-y', v: [0, -1, 0], lbl: 'along −Y'},
+  {k: '+y', v: [0, 1, 0],  lbl: 'along +Y'},
+  {k: '-x', v: [-1, 0, 0], lbl: 'along −X'},
+  {k: '+x', v: [1, 0, 0],  lbl: 'along +X'},
+  {k: 'face', v: null,     lbl: 'into the face'}
+];
+
+/* Unit direction a pick's arrows should be drawn along, or null when it has
+   none of its own and each sample's surface normal is the honest answer. */
+function pickDir3(p){
+  const m = Math.hypot(p.fx || 0, p.fy || 0, p.fz || 0);
+  if(!m) return null;
+  return [(p.fx || 0) / m, (p.fy || 0) / m, (p.fz || 0) / m];
+}
+
+/* Click a selected load again to turn it. Keeps the magnitude and changes
+   only where it points, which is the one property of a placed load that
+   anybody wants to change after placing it. */
+function cycleDir3(p){
+  const mag = Math.hypot(p.fx || 0, p.fy || 0, p.fz || 0)
+              || Math.abs(parseFloat($('pickMag').value) || 0) || 500;
+  const at = DIR3.findIndex(d => d.k === p.dir3);
+  const nxt = DIR3[(at + 1) % DIR3.length];
+  if(nxt.v){
+    p.fx = nxt.v[0] * mag; p.fy = nxt.v[1] * mag; p.fz = nxt.v[2] * mag;
+    p.pressure = 0;
+  }else{
+    p.fx = 0; p.fy = 0; p.fz = 0;
+  }
+  p.dir3 = nxt.k;
+  return nxt.lbl;
+}
+
 function partXY(cv, e){
   const b = cv.getBoundingClientRect();
   if(!b.width || !b.height) return null;
@@ -2362,14 +2405,36 @@ function faceAt3d(src, ti){
   // faces is rarely shallower than forty -- the plate and the pocket wall in
   // the screenshot that prompted this meet at ninety.
   const COS_STEP = Math.cos(40 * Math.PI / 180);
+  // Orientation is carried along WITH the flood, not assumed.
+  //
+  // A tessellator does not promise to wind every triangle of a face the same
+  // way, and a real STEP solid does not: on a plate whose top face is 1468
+  // triangles, a signed test against the neighbour's raw normal reached ONE
+  // of them, because the very first neighbour happened to be wound the other
+  // way and read as 180 degrees off. Every synthetic test here wound its own
+  // geometry consistently and so never saw it.
+  //
+  // So each triangle gets a sign that makes it agree with the one it was
+  // reached from, and the patch is described with those corrected normals.
+  // That matters beyond the flood: the samples sent to the solver carry
+  // normals, and the solver uses their RELATIVE directions to tell the near
+  // face of a thin wall from the far one. Mixed winding would have made that
+  // test meaningless.
+  const faceTris = [];
+  const sign = new Map([[ti, 1]]);
   while(queue.length){
     const i = queue.pop();
-    const g = tri3dGeom(src, i);
-    patch.push(g);
+    const gi = tri3dGeom(src, i);
+    const si = sign.get(i) || 1;
+    const ni = [gi.n[0]*si, gi.n[1]*si, gi.n[2]*si];
+    patch.push({c: gi.c, n: ni, a: gi.a, P: gi.P});
+    faceTris.push(i);
     for(const j of adj[i]){
       if(seen.has(j)) continue;
       const h = tri3dGeom(src, j);
-      if(h.n[0]*g.n[0] + h.n[1]*g.n[1] + h.n[2]*g.n[2] < COS_STEP) continue;
+      const d = h.n[0]*ni[0] + h.n[1]*ni[1] + h.n[2]*ni[2];
+      if(Math.abs(d) < COS_STEP) continue;
+      sign.set(j, d < 0 ? -1 : 1);
       seen.add(j); queue.push(j);
     }
   }
@@ -2397,6 +2462,19 @@ function faceAt3d(src, ti){
   if(r <= 0) return null;
   const mm2 = A;
 
+  // Sample points, for both shapes. A curved face SENDS these; a flat face
+  // only draws arrows on them. Building them once means a flat face gets
+  // arrows across it too -- the first version attached them to curved faces
+  // only, so selecting the flat top of a plate drew a tinted face with
+  // nothing on it to say which way the load went.
+  const MAXS = 240;
+  const sstep = Math.max(1, Math.ceil(patch.length / MAXS));
+  const samples = [];
+  for(let i = 0; i < patch.length; i += sstep){
+    const g = patch[i];
+    samples.push([g.c[0], g.c[1], g.c[2], g.n[0], g.n[1], g.n[2]]);
+  }
+
   if(flat <= Math.max(src.span * 0.004, 0.05)){
     // Flat. A plane says it exactly and in six numbers, and the plane test on
     // the solver's side is sharper than a cloud of samples can be, so flat
@@ -2407,7 +2485,7 @@ function faceAt3d(src, ti){
     // which is an element thick, not a part thick -- so it scales gently and
     // is capped. A wide band on a stepped part would reach the next step up.
     return {shape: 'plane', x: cx, y: cy, z: cz, r: r * 1.02,
-            nx: nx, ny: ny, nz: nz,
+            nx: nx, ny: ny, nz: nz, tri: faceTris, pts: samples,
             tol: Math.min(Math.max(src.span * 0.002, 0.15), 0.8),
             label: 'face ' + mm2.toFixed(0) + ' mm²'};
   }
@@ -2418,13 +2496,6 @@ function faceAt3d(src, ti){
   // was wrong: in any CAD package clicking a cylindrical face selects the
   // whole cylinder, and a stress tool that cannot say "this bore carries the
   // load" cannot describe a bolted joint.
-  const MAX = 240;
-  const step = Math.max(1, Math.ceil(patch.length / MAX));
-  const samples = [];
-  for(let i = 0; i < patch.length; i += step){
-    const g = patch[i];
-    samples.push([g.c[0], g.c[1], g.c[2], g.n[0], g.n[1], g.n[2]]);
-  }
   // One radius, sized so the discs round the samples overlap rather than
   // leaving gaps of unselected face between them. Area per sample is A/n, so
   // a disc of sqrt(A/(pi*n)) just covers its share and the 1.8 is the overlap.
@@ -2433,8 +2504,12 @@ function faceAt3d(src, ti){
   // when two are available is how the thin-plate bug happened the first time.
   const rs = Math.min(1.8 * Math.sqrt(A / (Math.PI * samples.length)),
                       Math.max(src.span * 0.05, 1.0));
+  // `tri` is for DRAWING only and never leaves the browser: it indexes the
+  // viewer's own tessellation, which means nothing to the solver. Shading the
+  // real triangles is what makes a selected face look selected, the way
+  // SolidWorks tints one, instead of a scatter of dots hovering over it.
   return {shape: 'patch', x: cx, y: cy, z: cz, r: rs,
-          nx: nx, ny: ny, nz: nz, pts: samples,
+          nx: nx, ny: ny, nz: nz, pts: samples, tri: faceTris,
           label: 'curved face ' + mm2.toFixed(0) + ' mm²'};
 }
 
@@ -2476,15 +2551,40 @@ function solidClick(e){
   const src = solid3d || mesh3d; if(!src) return;
   const hit = pick3dHitTest(e);
   if(hit >= 0){
-    SEL = {list: '3d', i: hit};
-    setStatusHint('Selected. Drag to move it, Backspace to delete it.');
+    const p = PICKS3D[hit];
+    // First click selects, a second click on the SAME marker turns it. One
+    // button, two meanings, ordered so that the destructive-looking one needs
+    // the deliberate second press -- and so that a load's direction can be
+    // changed on the part rather than by finding a control in the sidebar.
+    if(SEL && SEL.list === '3d' && SEL.i === hit && p && p.role === 'load'){
+      const lbl = cycleDir3(p);
+      setStatusHint('Load now points ' + lbl + '. Click again to turn it.');
+    }else{
+      SEL = {list: '3d', i: hit};
+      setStatusHint(p && p.role === 'load'
+        ? 'Selected. Click again to turn it, drag to move, Backspace to delete.'
+        : 'Selected. Drag to move it, Backspace to delete it.');
+    }
     afterPickChange();
     return;
   }
   const f = make3dPick(e);
   if(!f){setStatusHint('Click on the solid itself.'); return}
-  PICKS3D.push(Object.assign({role: pickMode}, f,
-                             pickMode === 'load' ? loadSpec() : {}));
+  const q = Object.assign({role: pickMode}, f,
+                          pickMode === 'load' ? loadSpec() : {});
+  // A new load on a solid starts pointing INTO the face it was placed on.
+  //
+  // The compass buttons mean "down the picture", which is a statement about
+  // the flat views; a solid can be turned any way up, so carrying those
+  // numbers across would point the load somewhere the reader did not choose
+  // and could not predict. Into the face is both well defined and what a
+  // bearing load on a bore usually is. Pressure and torque come through
+  // untouched -- neither is a compass direction in the first place.
+  if(q.role === 'load' && !q.pressure && !q.torque){
+    q.fx = 0; q.fy = 0; q.fz = 0;
+    q.dir3 = 'face';
+  }
+  PICKS3D.push(q);
   SEL = {list: '3d', i: PICKS3D.length - 1};
   afterPickChange();
 }
@@ -2582,6 +2682,13 @@ function renderPickList(){
     let k;
     if(p.pressure) k = (p.pressure / 1e6).toFixed(1) + ' MPa pressure';
     else if(p.torque) k = p.torque.toFixed(0) + ' N·m torque';
+    else if(p.dir3){
+      // A load on the solid names the model axis it points along, because
+      // "down" is not a thing a part that can be rotated has.
+      const d3 = DIR3.find(d => d.k === p.dir3);
+      const m = Math.hypot(p.fx || 0, p.fy || 0, p.fz || 0);
+      k = (m ? m.toFixed(0) + ' N ' : 'load ') + (d3 ? d3.lbl : p.dir3);
+    }
     else {
       const m = Math.hypot(p.fx || 0, p.fy || 0);
       const nm = {down: '↓', up: '↑', left: '←', right: '→'}[p.dir] || '';
@@ -2750,49 +2857,91 @@ function drawPicks3d(ctx, rot, S){
     // A selected face shows its own extent: the circle that the patch fits
     // inside, drawn in the plane the solver was handed, so what is on screen
     // is what was sent rather than a symbol standing in for it.
-    // A curved face shows the samples that were actually sent. Drawing the
-    // real thing rather than a symbol for it means a selection that grabbed
-    // half a bore looks like half a bore on screen, instead of looking
-    // correct and solving wrong.
-    if(p.shape === 'patch' && p.pts && p.pts.length){
+    // The selected face, shaded, with the load drawn ON it.
+    //
+    // This is how every CAD package shows a condition and it is not
+    // decoration: a scatter of markers hovering near a part tells you a pick
+    // exists, while a tinted face with arrows across it tells you WHICH face
+    // and WHICH WAY -- the two things that decide the answer. The triangles
+    // shaded are the viewer's own, the same ones the grower walked, so a
+    // selection that caught half a bore looks like half a bore rather than
+    // looking correct and solving wrong.
+    const col = p.role === 'fixed' ? '#7dd3fc' : '#ffd166';
+    const src3 = (typeof solid3d !== 'undefined' && solid3d)
+                 || (typeof mesh3d !== 'undefined' && mesh3d) || null;
+    if(p.tri && p.tri.length && src3 && src3.tris){
       ctx.save();
-      ctx.globalAlpha = on ? 0.95 : 0.65;
-      ctx.fillStyle = p.role === 'fixed' ? '#7dd3fc' : '#ffd166';
-      for(const s of p.pts){
-        const w = S(rot([s[0], s[1], s[2]]));
+      ctx.globalAlpha = on ? 0.58 : 0.38;
+      ctx.fillStyle = col;
+      for(const ti of p.tri){
+        const t = src3.tris[ti];
+        if(!t) continue;
+        const P = src3.verts ? [src3.verts[t[0]], src3.verts[t[1]],
+                                src3.verts[t[2]]] : t;
+        const a = S(rot(P[0])), b = S(rot(P[1])), c = S(rot(P[2]));
         ctx.beginPath();
-        ctx.arc(w[0], w[1], on ? 2.6 : 2.0, 0, 6.2832);
-        ctx.fill();
+        ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.lineTo(c[0], c[1]);
+        ctx.closePath(); ctx.fill();
       }
       ctx.restore();
     }
-    if(p.shape === 'plane' && p.r > 0){
-      const n = [p.nx, p.ny, p.nz];
-      const ref = Math.abs(n[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
-      let t1 = [n[1]*ref[2] - n[2]*ref[1], n[2]*ref[0] - n[0]*ref[2],
-                n[0]*ref[1] - n[1]*ref[0]];
-      const l1 = Math.hypot(t1[0], t1[1], t1[2]) || 1;
-      t1 = [t1[0]/l1, t1[1]/l1, t1[2]/l1];
-      const t2 = [n[1]*t1[2] - n[2]*t1[1], n[2]*t1[0] - n[0]*t1[2],
-                  n[0]*t1[1] - n[1]*t1[0]];
-      ctx.beginPath();
-      for(let j = 0; j <= 28; j++){
-        const a = j * 6.2832 / 28, ca = Math.cos(a) * p.r, sa = Math.sin(a) * p.r;
-        const w = S(rot([p.x + t1[0]*ca + t2[0]*sa,
-                         p.y + t1[1]*ca + t2[1]*sa,
-                         p.z + t1[2]*ca + t2[2]*sa]));
-        if(j) ctx.lineTo(w[0], w[1]); else ctx.moveTo(w[0], w[1]);
+
+    // Arrows along the face, pointing the way the load actually points.
+    // A load with no vector of its own -- a pressure, or a bearing load that
+    // has not been given a direction yet -- is drawn along each sample's own
+    // surface normal, which is what it physically is.
+    if(p.pts && p.pts.length){
+      const d = pickDir3(p);
+      const span = (src3 && src3.span) || 50;
+      const L = span * 0.06;
+      const step = Math.max(1, Math.ceil(p.pts.length / 26));
+      ctx.save();
+      ctx.strokeStyle = col; ctx.fillStyle = col;
+      ctx.lineWidth = on ? 2.2 : 1.6;
+      ctx.globalAlpha = on ? 1 : 0.85;
+      for(let k = 0; k < p.pts.length; k += step){
+        const sm = p.pts[k];
+        // Along the pick's direction, or along this sample's own normal.
+        const v = d || [-sm[3], -sm[4], -sm[5]];
+        const tail = S(rot([sm[0] - v[0]*L, sm[1] - v[1]*L, sm[2] - v[2]*L]));
+        const head = S(rot([sm[0], sm[1], sm[2]]));
+        const dx = head[0]-tail[0], dy = head[1]-tail[1];
+        const ln = Math.hypot(dx, dy);
+        if(ln < 5){
+          // Pointing at or away from the camera, where an arrow projects to
+          // nothing. Draw what a drawing would: a dot in a circle for a
+          // vector coming towards you, a cross in a circle for one going
+          // away. Skipping these -- which the first version did -- meant a
+          // load normal to the face you are looking at showed no arrows at
+          // all, which is precisely the case a bearing load on a bore is.
+          const toward = rot([sm[0], sm[1], sm[2]])[2] >
+                         rot([sm[0]-v[0]*L, sm[1]-v[1]*L, sm[2]-v[2]*L])[2];
+          const R0 = 4.2;
+          ctx.beginPath(); ctx.arc(head[0], head[1], R0, 0, 6.2832);
+          ctx.stroke();
+          ctx.beginPath();
+          if(toward){
+            ctx.arc(head[0], head[1], 1.5, 0, 6.2832); ctx.fill();
+          }else{
+            const d0 = R0 * 0.7;
+            ctx.moveTo(head[0]-d0, head[1]-d0); ctx.lineTo(head[0]+d0, head[1]+d0);
+            ctx.moveTo(head[0]-d0, head[1]+d0); ctx.lineTo(head[0]+d0, head[1]-d0);
+            ctx.stroke();
+          }
+          continue;
+        }
+        const ux = dx/ln, uy = dy/ln, h = Math.min(7, ln*0.45);
+        ctx.beginPath();
+        ctx.moveTo(tail[0], tail[1]); ctx.lineTo(head[0], head[1]); ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(head[0], head[1]);
+        ctx.lineTo(head[0]-ux*h - uy*h*0.55, head[1]-uy*h + ux*h*0.55);
+        ctx.lineTo(head[0]-ux*h + uy*h*0.55, head[1]-uy*h - ux*h*0.55);
+        ctx.closePath(); ctx.fill();
       }
-      ctx.closePath();
-      ctx.globalAlpha = on ? 0.3 : 0.17;
-      ctx.fillStyle = p.role === 'fixed' ? '#7dd3fc' : '#ffd166';
-      ctx.fill();
-      ctx.globalAlpha = on ? 0.95 : 0.6;
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-      ctx.globalAlpha = 1;
-      ctx.lineWidth = 2;
+      ctx.restore();
     }
+
     if(on){
       ctx.save();
       ctx.strokeStyle = '#ffffff';
